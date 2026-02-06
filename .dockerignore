@@ -1,0 +1,7 @@
+node_modules
+web/node_modules
+web/dist
+.dev_local
+.git
+*.md
+!README.md
