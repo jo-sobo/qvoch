@@ -181,7 +181,7 @@ export function ChatPanel() {
 
       <div className="relative p-3 border-border">
         {mentionFilter !== null && mentionSuggestions.length > 0 && (
-          <div className="absolute bottom-full left-3 mb-1 bg-bg-secondary border border-border rounded-md shadow-lg z-50 py-1 min-w-[150px]">
+          <div className="absolute bottom-full left-3 mb-1 bg-bg-secondary border border-border rounded-md shadow-lg z-50 py-1 min-w-37.5">
             {mentionSuggestions.map((user, i) => (
               <button
                 key={user.id}
@@ -281,7 +281,7 @@ function MessageContent({
       <img
         src={gifUrl}
         alt="GIF"
-        className="max-w-[200px] rounded"
+        className="max-w-50 rounded"
         loading="lazy"
       />
     );

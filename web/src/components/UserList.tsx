@@ -168,7 +168,7 @@ export function UserList() {
                     {sub.name || 'Private'}
                   </span>
                 </div>
-                {sub.expiresAt && sub.expiresAt > Date.now() && (
+                {sub.expiresAt && (
                   <div className="mt-1">
                     <SubCountdownTimer expiresAt={sub.expiresAt} />
                   </div>
