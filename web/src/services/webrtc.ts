@@ -12,22 +12,11 @@ let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let localAnalyser: AnalyserNode | null = null;
+let pendingCandidates: RTCIceCandidateInit[] = [];
 
-let localAudioReadyResolve: (() => void) | null = null;
-let localAudioPromise: Promise<void> | null = null;
-
-export function resetLocalAudioPromise(): void {
-  localAudioPromise = new Promise<void>((resolve) => {
-    localAudioReadyResolve = resolve;
-  });
-}
-
-function resolveLocalAudioPromise(): void {
-  if (localAudioReadyResolve) {
-    localAudioReadyResolve();
-    localAudioReadyResolve = null;
-  }
-}
+// No-ops: mic is now requested before create/join, so handleOffer no longer
+// needs to wait for local audio. Kept as exports for API compatibility.
+export function resetLocalAudioPromise(): void {}
 
 const remoteStreams = new Map<
   string,
@@ -60,7 +49,6 @@ export function setLocalVolumeCallback(cb: LocalVolumeCallback | null): void {
 
 export async function initLocalAudio(deviceId?: string | null): Promise<MediaStream> {
   if (localStream && !deviceId) {
-    resolveLocalAudioPromise();
     return localStream;
   }
 
@@ -84,6 +72,12 @@ export async function initLocalAudio(deviceId?: string | null): Promise<MediaStr
 
   localStream = newStream;
 
+  // Apply current mute state to newly acquired tracks
+  const isMuted = useStore.getState().muted;
+  for (const track of newStream.getAudioTracks()) {
+    track.enabled = !isMuted;
+  }
+
   ensureAudioContext();
   if (audioContext) {
     try {
@@ -94,8 +88,6 @@ export async function initLocalAudio(deviceId?: string | null): Promise<MediaStr
     } catch {
     }
   }
-
-  resolveLocalAudioPromise();
 
   return localStream;
 }
@@ -112,6 +104,10 @@ export async function switchAudioInput(deviceId: string): Promise<void> {
   }
 }
 
+export function isLocalAudioReady(): boolean {
+  return localStream !== null;
+}
+
 export function ensureAudioContext(): void {
   if (!audioContext) {
     audioContext = new AudioContext();
@@ -121,22 +117,40 @@ export function ensureAudioContext(): void {
   }
 }
 
-export async function handleOffer(sdp: string): Promise<void> {
-  if (localAudioPromise) {
-    await localAudioPromise;
+export async function handleOffer(sdp: string, reset?: boolean): Promise<void> {
+  // When reset=true, the server created a brand-new PeerConnection (room
+  // transition) — the client MUST tear down its old PC and build a fresh one.
+  // Otherwise, reuse the existing PC for renegotiation (new peer joined, etc.).
+  const canReuse = !reset
+    && pc !== null
+    && pc.connectionState !== 'failed'
+    && pc.connectionState !== 'closed';
+
+  if (!canReuse) {
+    createPeerConnection();
   }
 
-  createPeerConnection();
-  if (!pc) return;
+  // Capture in local variable for TypeScript narrowing across awaits
+  const currentPc = pc;
+  if (!currentPc) return;
 
   const offer = new RTCSessionDescription({ type: 'offer', sdp });
 
   try {
-    await pc.setRemoteDescription(offer);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    if (pc.localDescription) {
-      send('answer', { sdp: pc.localDescription.sdp });
+    await currentPc.setRemoteDescription(offer);
+
+    // Flush any ICE candidates that arrived before the PC was ready
+    for (const ice of pendingCandidates) {
+      currentPc.addIceCandidate(new RTCIceCandidate(ice)).catch((err) =>
+        console.error('Failed to add buffered ICE candidate:', err)
+      );
+    }
+    pendingCandidates = [];
+
+    const answer = await currentPc.createAnswer();
+    await currentPc.setLocalDescription(answer);
+    if (currentPc.localDescription) {
+      send('answer', { sdp: currentPc.localDescription.sdp });
     }
   } catch (err) {
     console.error('Failed to handle offer:', err);
@@ -144,13 +158,16 @@ export async function handleOffer(sdp: string): Promise<void> {
 }
 
 export function handleCandidate(candidate: string, sdpMid: string, sdpMLineIndex: number | null): void {
-  if (!pc) return;
-
   const ice: RTCIceCandidateInit = {
     candidate,
     sdpMid: sdpMid || undefined,
     sdpMLineIndex: sdpMLineIndex ?? undefined,
   };
+
+  if (!pc || !pc.remoteDescription) {
+    pendingCandidates.push(ice);
+    return;
+  }
 
   pc.addIceCandidate(new RTCIceCandidate(ice)).catch((err) =>
     console.error('Failed to add ICE candidate:', err)
@@ -158,6 +175,14 @@ export function handleCandidate(candidate: string, sdpMid: string, sdpMLineIndex
 }
 
 function createPeerConnection(): void {
+  if (typeof RTCPeerConnection === 'undefined') {
+    console.error('WebRTC is not available in this browser. Check that WebRTC is enabled (Firefox: about:config → media.peerconnection.enabled) and no extensions are blocking it.');
+    useStore.getState().setWebrtcUnavailable(true);
+    return;
+  }
+
+  pendingCandidates = [];
+
   if (pc) {
     pc.close();
     pc = null;
@@ -208,10 +233,14 @@ function createPeerConnection(): void {
         analyser.fftSize = 256;
 
         const userId = extractUserIdFromStreamId(streamId);
-        const userVolumes = useStore.getState().userVolumes;
-        gainNode.gain.value = userId && userVolumes[userId] != null
-          ? userVolumes[userId] / 100
-          : 1.0;
+        const { userVolumes, outputMuted } = useStore.getState();
+        if (outputMuted) {
+          gainNode.gain.value = 0;
+        } else {
+          gainNode.gain.value = userId && userVolumes[userId] != null
+            ? userVolumes[userId] / 100
+            : 1.0;
+        }
 
         sourceNode.connect(gainNode);
         gainNode.connect(analyser);
@@ -355,6 +384,4 @@ export function closeWebRTC(): void {
     audioContext = null;
   }
 
-  localAudioPromise = null;
-  localAudioReadyResolve = null;
 }

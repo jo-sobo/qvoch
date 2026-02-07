@@ -43,6 +43,7 @@ interface AppState {
   audioOutputDeviceId: string | null;
   voiceMode: VoiceMode;
   vadThreshold: number;
+  webrtcUnavailable: boolean;
 
   setTheme: (theme: Theme) => void;
   setConnectionState: (connected: boolean) => void;
@@ -72,6 +73,7 @@ interface AppState {
   setAudioOutputDeviceId: (id: string | null) => void;
   setVoiceMode: (mode: VoiceMode) => void;
   setVadThreshold: (threshold: number) => void;
+  setWebrtcUnavailable: (unavailable: boolean) => void;
   reset: () => void;
 }
 
@@ -123,6 +125,7 @@ const initialState = {
   audioOutputDeviceId: localStorage.getItem('qvoch-audio-output') || null,
   voiceMode: getStoredVoiceMode(),
   vadThreshold: getStoredVadThreshold(),
+  webrtcUnavailable: false,
 };
 
 export const useStore = create<AppState>((set) => ({
@@ -208,6 +211,7 @@ export const useStore = create<AppState>((set) => ({
     localStorage.setItem('qvoch-vad-threshold', String(threshold));
     set({ vadThreshold: threshold });
   },
+  setWebrtcUnavailable: (unavailable) => set({ webrtcUnavailable: unavailable }),
 
   reset: () => set(initialState),
 }));

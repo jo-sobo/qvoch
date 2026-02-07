@@ -99,7 +99,8 @@ type RoomUpdatePayload struct {
 }
 
 type OfferPayload struct {
-	SDP string `json:"sdp"`
+	SDP   string `json:"sdp"`
+	Reset bool   `json:"reset,omitempty"`
 }
 
 type ChatMessageOut struct {

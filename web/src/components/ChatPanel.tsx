@@ -42,15 +42,19 @@ export function ChatPanel() {
         .slice(0, 5)
     : [];
 
+  const addToast = useStore((s) => s.addToast);
+
   const sendText = useCallback(async (text: string) => {
     if (!text || !e2eKey) return;
     try {
       const ciphertext = await encryptMessage(e2eKey, text);
-      send('chat', { ciphertext });
+      if (!send('chat', { ciphertext })) {
+        addToast('Message not sent — reconnecting...');
+      }
     } catch (err) {
       console.error('Failed to encrypt message:', err);
     }
-  }, [e2eKey]);
+  }, [e2eKey, addToast]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();

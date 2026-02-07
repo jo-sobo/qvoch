@@ -113,6 +113,7 @@ export interface RoomUpdatePayload {
 
 export interface OfferPayload {
   sdp: string;
+  reset?: boolean;
 }
 
 export interface InviteReqPayload {

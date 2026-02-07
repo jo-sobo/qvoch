@@ -1,5 +1,5 @@
 import { useStore } from '../stores/useStore';
-import { handleOffer, handleCandidate as handleRTCCandidate, initLocalAudio, ensureAudioContext, resetLocalAudioPromise, closeWebRTC } from './webrtc';
+import { handleOffer, handleCandidate as handleRTCCandidate, initLocalAudio, ensureAudioContext, resetLocalAudioPromise, isLocalAudioReady, closeWebRTC } from './webrtc';
 import { deriveRoomKey, decryptMessage, exportKey, storeRoomKey, importKey, getRoomKey } from './crypto';
 import type {
   WelcomePayload,
@@ -86,17 +86,34 @@ export function connect(): void {
   const store = useStore.getState();
   store.setReconnecting(reconnectAttempts > 0);
 
-  ws = new WebSocket(getWsUrl());
+  const thisWs = new WebSocket(getWsUrl());
+  ws = thisWs;
 
-  ws.onopen = () => {
+  thisWs.onopen = () => {
     reconnectAttempts = 0;
     const store = useStore.getState();
     store.setConnectionState(true);
     store.setReconnecting(false);
+
+    // Auto-rejoin room after WebSocket reconnect.
+    // Init audio first so local tracks are available when the offer arrives.
+    if (store.roomId && store.username && store.inviteToken) {
+      const { username, inviteToken, audioInputDeviceId } = store;
+      resetLocalAudioPromise();
+      initLocalAudio(audioInputDeviceId)
+        .catch(() => {})
+        .then(() => {
+          send('join', { username, inviteToken });
+        });
+    }
   };
 
-  ws.onclose = () => {
-    ws = null;
+  thisWs.onclose = () => {
+    // Only null out `ws` if this is still the active socket.
+    // Prevents a stale onclose from killing a newer connection.
+    if (ws === thisWs) {
+      ws = null;
+    }
     const store = useStore.getState();
     store.setConnectionState(false);
 
@@ -105,10 +122,10 @@ export function connect(): void {
     }
   };
 
-  ws.onerror = () => {
+  thisWs.onerror = () => {
   };
 
-  ws.onmessage = (event) => {
+  thisWs.onmessage = (event) => {
     try {
       const envelope = JSON.parse(event.data as string) as { type: string; payload: unknown };
       handleMessage(envelope.type, envelope.payload);
@@ -144,12 +161,13 @@ export function disconnect(): void {
   }
 }
 
-export function send(type: string, payload: unknown): void {
+export function send(type: string, payload: unknown): boolean {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.warn('WebSocket not connected, cannot send:', type);
-    return;
+    return false;
   }
   ws.send(JSON.stringify({ type, payload }));
+  return true;
 }
 
 function handleMessage(type: string, payload: unknown): void {
@@ -190,12 +208,22 @@ function handleMessage(type: string, payload: unknown): void {
         }
       });
 
+      // Restore password from sessionStorage if not in store (page reload case)
+      if (!store.password) {
+        const savedPassword = sessionStorage.getItem('qvoch-password');
+        if (savedPassword) {
+          store.setPassword(savedPassword);
+        }
+      }
+
       ensureAudioContext();
-      resetLocalAudioPromise();
-      const audioInputDeviceId = store.audioInputDeviceId;
-      initLocalAudio(audioInputDeviceId).catch((err) => {
-        console.error('Failed to get microphone:', err);
-      });
+      // Only init audio if not already available (mic was requested before join)
+      if (!isLocalAudioReady()) {
+        resetLocalAudioPromise();
+        initLocalAudio(store.audioInputDeviceId).catch((err) => {
+          console.error('Failed to get microphone:', err);
+        });
+      }
 
       window.location.hash = `#/room/${p.roomState.id}`;
       break;
@@ -282,7 +310,7 @@ function handleMessage(type: string, payload: unknown): void {
 
     case 'offer': {
       const p = payload as OfferPayload;
-      handleOffer(p.sdp).catch((err) => console.error('Failed to handle offer:', err));
+      handleOffer(p.sdp, p.reset).catch((err) => console.error('Failed to handle offer:', err));
       break;
     }
 
@@ -373,10 +401,12 @@ async function deriveE2EKey(roomFullName: string): Promise<CryptoKey | null> {
 
 export function persistSessionForRejoin(): void {
   const store = useStore.getState();
-  if (store.sessionToken && store.roomId) {
-    localStorage.setItem('qvoch-session-token', store.sessionToken);
+  if (store.roomId) {
     localStorage.setItem('qvoch-session-time', String(Date.now()));
     localStorage.setItem('qvoch-session-username', store.username);
+    if (store.inviteToken) {
+      localStorage.setItem('qvoch-session-invite', store.inviteToken);
+    }
   }
 }
 

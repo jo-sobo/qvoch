@@ -136,6 +136,12 @@ func extractIP(r *http.Request) string {
 	return host
 }
 
+const (
+	pingInterval = 30 * time.Second
+	pongWait     = 60 * time.Second
+	writeWait    = 10 * time.Second
+)
+
 func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ip := extractIP(r)
 
@@ -159,7 +165,32 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("peer connected: %s ip=%s", peerID, ip)
 
+	// Ping/pong keepalive: set read deadline and pong handler
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	// Start ping ticker goroutine
+	pingDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := peer.WritePing(time.Now().Add(writeWait)); err != nil {
+					return
+				}
+			case <-pingDone:
+				return
+			}
+		}
+	}()
+
 	defer func() {
+		close(pingDone)
 		hub := sfu.GetHub()
 		hub.RemovePeer(peer)
 		conn.Close()
@@ -167,7 +198,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	hub := sfu.GetHub()
-	limiter := newRateLimiter(10)
+	limiter := newRateLimiter(30)
 	violations := 0
 
 	for {

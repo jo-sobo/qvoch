@@ -343,6 +343,19 @@ func (h *Hub) RemovePeer(peer *Peer) {
 
 		if currentRoom != nil {
 			h.sendSubCountdownIfNeeded(currentRoom)
+
+			// Immediately clean up empty sub-channels
+			if mok {
+				mainRoom.mu.Lock()
+				currentRoom.mu.RLock()
+				subEmpty := len(currentRoom.Peers) == 0
+				subID := currentRoom.ID
+				currentRoom.mu.RUnlock()
+				if subEmpty {
+					delete(mainRoom.SubChannels, subID)
+				}
+				mainRoom.mu.Unlock()
+			}
 		}
 
 		if mok {
@@ -585,10 +598,23 @@ func (h *Hub) HandleSubResponse(peer *Peer, inviteID string, accepted bool) {
 		ChatHistory: make([]ChatMessage, 0),
 	}
 
-	h.RemoveTrackFromPeers(invite.FromPeer, mainRoom)
-	h.RemoveTrackFromPeers(invite.ToPeer, mainRoom)
+	// Save tracks before closing PCs — we need them to remove from remaining peers.
+	invite.FromPeer.RLock()
+	fromTrack := invite.FromPeer.Track
+	invite.FromPeer.RUnlock()
+
+	invite.ToPeer.RLock()
+	toTrack := invite.ToPeer.Track
+	invite.ToPeer.RUnlock()
+
+	// Close PCs FIRST so the moving peers don't receive spurious renegotiation
+	// offers (their PC is about to be replaced for the sub-channel).
 	h.ClosePeerConnection(invite.FromPeer)
 	h.ClosePeerConnection(invite.ToPeer)
+
+	// Remove tracks from remaining main room peers only (moving peers have PC=nil).
+	h.removeTrackFromRoomPeers(fromTrack, mainRoom)
+	h.removeTrackFromRoomPeers(toTrack, mainRoom)
 
 	mainRoom.mu.Lock()
 	mainRoom.RemovePeer(invite.FromPeer.ID)
@@ -666,6 +692,16 @@ func (h *Hub) HandleMoveToMain(peer *Peer) {
 
 	if subOk {
 		h.sendSubCountdownIfNeeded(sub)
+
+		// Immediately clean up empty sub-channels
+		mainRoom.mu.Lock()
+		sub.mu.RLock()
+		subEmpty := len(sub.Peers) == 0
+		sub.mu.RUnlock()
+		if subEmpty {
+			delete(mainRoom.SubChannels, sub.ID)
+		}
+		mainRoom.mu.Unlock()
 	}
 
 	if err := h.CreatePeerConnection(peer, mainRoom); err != nil {
@@ -738,6 +774,16 @@ func (h *Hub) HandleMoveToSub(peer *Peer, targetSubID string) {
 		mainRoom.mu.RUnlock()
 		if oldOk {
 			h.sendSubCountdownIfNeeded(oldSub)
+
+			// Immediately clean up empty sub-channels
+			mainRoom.mu.Lock()
+			oldSub.mu.RLock()
+			oldSubEmpty := len(oldSub.Peers) == 0
+			oldSub.mu.RUnlock()
+			if oldSubEmpty {
+				delete(mainRoom.SubChannels, currentRoomID)
+			}
+			mainRoom.mu.Unlock()
 		}
 	}
 

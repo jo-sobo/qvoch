@@ -118,7 +118,9 @@ func (h *Hub) CreatePeerConnection(peer *Peer, room *Room) error {
 		existingPeer.RUnlock()
 
 		if existingTrack != nil {
-			if _, err := pc.AddTrack(existingTrack); err != nil {
+			if _, err := pc.AddTransceiverFromTrack(existingTrack, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionSendonly,
+			}); err != nil {
 				log.Printf("failed to add track from %s to %s: %v", existingPeer.ID, peer.ID, err)
 			}
 		}
@@ -194,7 +196,7 @@ func (h *Hub) SendOffer(peer *Peer) error {
 		return fmt.Errorf("set local description: %w", err)
 	}
 
-	peer.SendJSON("offer", OfferPayload{SDP: offer.SDP})
+	peer.SendJSON("offer", OfferPayload{SDP: offer.SDP, Reset: true})
 	return nil
 }
 
@@ -214,6 +216,21 @@ func (h *Hub) HandleAnswer(peer *Peer, sdp string) error {
 
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("set remote description: %w", err)
+	}
+
+	// Check if a renegotiation was deferred while we were waiting for this answer.
+	peer.Lock()
+	needsRenego := peer.NeedsRenegotiation
+	peer.NeedsRenegotiation = false
+	peer.Unlock()
+
+	if needsRenego {
+		log.Printf("peer %s: triggering deferred renegotiation", peer.ID)
+		go func() {
+			if err := h.renegotiate(peer); err != nil {
+				log.Printf("peer %s: deferred renegotiation failed: %v", peer.ID, err)
+			}
+		}()
 	}
 
 	return nil
@@ -279,7 +296,9 @@ func (h *Hub) AddTrackToPeers(newPeer *Peer, room *Room) {
 			continue
 		}
 
-		if _, err := pc.AddTrack(track); err != nil {
+		if _, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		}); err != nil {
 			log.Printf("failed to add track from %s to %s: %v", newPeer.ID, p.ID, err)
 			continue
 		}
@@ -353,6 +372,20 @@ func (h *Hub) renegotiate(peer *Peer) error {
 		return fmt.Errorf("no peer connection")
 	}
 
+	// Only renegotiate when the PC is in a stable state.
+	// If we're still waiting for an answer to a previous offer, mark for retry.
+	if pc.SignalingState() != webrtc.SignalingStateStable {
+		log.Printf("peer %s: deferring renegotiation, signaling state is %s", peer.ID, pc.SignalingState().String())
+		peer.Lock()
+		peer.NeedsRenegotiation = true
+		peer.Unlock()
+		return nil
+	}
+
+	peer.Lock()
+	peer.NeedsRenegotiation = false
+	peer.Unlock()
+
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
@@ -364,6 +397,44 @@ func (h *Hub) renegotiate(peer *Peer) error {
 
 	peer.SendJSON("offer", OfferPayload{SDP: offer.SDP})
 	return nil
+}
+
+// removeTrackFromRoomPeers removes a specific track from all PeerConnections in the room
+// and renegotiates affected peers. Used when the track owner's PC has already been closed
+// (so RemoveTrackFromPeers can't read the track from the peer).
+func (h *Hub) removeTrackFromRoomPeers(track *webrtc.TrackLocalStaticRTP, room *Room) {
+	if track == nil {
+		return
+	}
+
+	room.mu.RLock()
+	peers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		peers = append(peers, p)
+	}
+	room.mu.RUnlock()
+
+	for _, p := range peers {
+		p.RLock()
+		pc := p.PC
+		p.RUnlock()
+		if pc == nil {
+			continue
+		}
+
+		for _, sender := range pc.GetSenders() {
+			if sender.Track() == track {
+				if err := pc.RemoveTrack(sender); err != nil {
+					log.Printf("failed to remove track from %s: %v", p.ID, err)
+				}
+				break
+			}
+		}
+
+		if err := h.renegotiate(p); err != nil {
+			log.Printf("failed to renegotiate with %s: %v", p.ID, err)
+		}
+	}
 }
 
 func (h *Hub) getWebRTCAPI() *webrtc.API {

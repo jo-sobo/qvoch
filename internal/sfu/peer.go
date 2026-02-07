@@ -20,9 +20,10 @@ type Peer struct {
 	Track            *webrtc.TrackLocalStaticRTP
 	RoomID           string // Current room (main or sub-channel ID)
 	MainRoomID       string // Always the main channel ID
-	Muted            bool
-	mu               sync.RWMutex
-	writeMu          sync.Mutex
+	Muted              bool
+	NeedsRenegotiation bool
+	mu                 sync.RWMutex
+	writeMu            sync.Mutex
 }
 
 func (p *Peer) RLock()   { p.mu.RLock() }
@@ -55,4 +56,16 @@ func (p *Peer) SendJSON(msgType string, payload interface{}) {
 
 func (p *Peer) SendError(code, message string) {
 	p.SendJSON("error", ErrorPayload{Code: code, Message: message})
+}
+
+func (p *Peer) WritePing(deadline time.Time) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	if p.Conn == nil {
+		return nil
+	}
+	p.Conn.SetWriteDeadline(deadline)
+	err := p.Conn.WriteMessage(websocket.PingMessage, nil)
+	p.Conn.SetWriteDeadline(time.Time{}) // clear deadline so SendJSON writes aren't affected
+	return err
 }

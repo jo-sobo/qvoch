@@ -40,7 +40,7 @@ export function GifPicker({ onSelect, onClose }: GifPickerProps) {
   }, [query]);
 
   return (
-    <div className="absolute bottom-full left-0 mb-2 w-80 bg-bg-secondary border border-border rounded-lg shadow-xl z-50 overflow-hidden">
+    <div className="absolute bottom-full right-0 mb-2 w-80 bg-bg-secondary border border-border rounded-lg shadow-xl z-50 overflow-hidden">
       <div className="flex items-center gap-2 p-2 border-b border-border">
         <Search className="w-4 h-4 text-text-muted" />
         <input

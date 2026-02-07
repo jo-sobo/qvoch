@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -61,6 +62,23 @@ func sitePassphraseMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Invite links bypass site passphrase: set auth cookie and redirect to SPA
+		if strings.HasPrefix(r.URL.Path, "/invite/") {
+			rest := strings.TrimPrefix(r.URL.Path, "/invite/")
+			if rest != "" {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "qvoch-auth",
+					Value:    authToken,
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+					MaxAge:   int(30 * 24 * time.Hour / time.Second),
+				})
+				http.Redirect(w, r, "/#/join/"+rest, http.StatusTemporaryRedirect)
+				return
+			}
+		}
+
 		cookie, err := r.Cookie("qvoch-auth")
 		if err != nil || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(authToken)) != 1 {
 			http.Redirect(w, r, "/auth", http.StatusTemporaryRedirect)
@@ -89,7 +107,7 @@ func handleAuthPost(w http.ResponseWriter, r *http.Request) {
 		Value:    authToken,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
+		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(30 * 24 * time.Hour / time.Second),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)

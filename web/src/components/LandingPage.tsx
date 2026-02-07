@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useStore } from '../stores/useStore';
 import { connect, send, isOtherTabActive } from '../services/socket';
+import { initLocalAudio, resetLocalAudioPromise } from '../services/webrtc';
 import { decodePasswordFromLink } from '../services/crypto';
 import { Headphones, LogIn, Plus, Loader2 } from 'lucide-react';
 
@@ -42,15 +43,15 @@ export function LandingPage() {
   }, []);
 
   useEffect(() => {
-    const sessionToken = localStorage.getItem('qvoch-session-token');
+    const sessionInvite = localStorage.getItem('qvoch-session-invite');
     const sessionTime = localStorage.getItem('qvoch-session-time');
     const sessionUsername = localStorage.getItem('qvoch-session-username');
 
-    if (!sessionToken || !sessionTime || !sessionUsername) return;
+    if (!sessionInvite || !sessionTime || !sessionUsername) return;
 
     const elapsed = Date.now() - Number(sessionTime);
     if (elapsed > REJOIN_WINDOW_MS) {
-      localStorage.removeItem('qvoch-session-token');
+      localStorage.removeItem('qvoch-session-invite');
       localStorage.removeItem('qvoch-session-time');
       localStorage.removeItem('qvoch-session-username');
       return;
@@ -59,7 +60,7 @@ export function LandingPage() {
     isOtherTabActive().then((active) => {
       if (active) {
         useStore.getState().addToast('Already connected in another tab.');
-        localStorage.removeItem('qvoch-session-token');
+        localStorage.removeItem('qvoch-session-invite');
         localStorage.removeItem('qvoch-session-time');
         localStorage.removeItem('qvoch-session-username');
         return;
@@ -72,21 +73,33 @@ export function LandingPage() {
   useEffect(() => {
     if (!autoRejoining || !connected) return;
 
-    const sessionToken = localStorage.getItem('qvoch-session-token');
+    const sessionInvite = localStorage.getItem('qvoch-session-invite');
     const sessionUsername = localStorage.getItem('qvoch-session-username');
-    if (!sessionToken || !sessionUsername) {
+    if (!sessionInvite || !sessionUsername) {
       setAutoRejoining(false);
       return;
     }
 
-    send('join', {
-      username: sessionUsername,
-      sessionToken,
-    });
+    // Restore password from sessionStorage (survives page reload within same tab)
+    const savedPassword = sessionStorage.getItem('qvoch-password');
+    if (savedPassword) {
+      useStore.getState().setPassword(savedPassword);
+    }
+
+    // Init audio before rejoining (permission already granted, resolves quickly)
+    resetLocalAudioPromise();
+    initLocalAudio(useStore.getState().audioInputDeviceId)
+      .catch(() => {})
+      .then(() => {
+        send('join', {
+          username: sessionUsername,
+          inviteToken: sessionInvite,
+        });
+      });
 
     const timeout = setTimeout(() => {
       setAutoRejoining(false);
-      localStorage.removeItem('qvoch-session-token');
+      localStorage.removeItem('qvoch-session-invite');
       localStorage.removeItem('qvoch-session-time');
       localStorage.removeItem('qvoch-session-username');
     }, 5000);
@@ -103,8 +116,18 @@ export function LandingPage() {
       return;
     }
 
+    // Request mic permission before creating room (avoids ICE timeout while
+    // the browser shows the permission dialog after the offer arrives)
+    resetLocalAudioPromise();
+    try {
+      await initLocalAudio(useStore.getState().audioInputDeviceId);
+    } catch {
+      useStore.getState().addToast('Could not access microphone — voice chat won\'t work.');
+    }
+
     const store = useStore.getState();
     store.setPassword(password);
+    sessionStorage.setItem('qvoch-password', password);
 
     send('create', {
       username: username.trim(),
@@ -124,8 +147,17 @@ export function LandingPage() {
       return;
     }
 
+    // Request mic permission before joining room
+    resetLocalAudioPromise();
+    try {
+      await initLocalAudio(useStore.getState().audioInputDeviceId);
+    } catch {
+      useStore.getState().addToast('Could not access microphone — voice chat won\'t work.');
+    }
+
     if (inviteToken && invitePassword) {
       setStorePassword(invitePassword);
+      sessionStorage.setItem('qvoch-password', invitePassword);
       send('join', {
         username: username.trim(),
         inviteToken: inviteToken,
@@ -133,6 +165,7 @@ export function LandingPage() {
     } else {
       if (!channelName.trim() || !password.trim()) return;
       setStorePassword(password);
+      sessionStorage.setItem('qvoch-password', password);
       send('join', {
         username: username.trim(),
         channelName: channelName.trim(),
