@@ -233,7 +233,7 @@ function App() {
       {view === 'room' ? <RoomView /> : <LandingPage />}
       <ToastContainer />
       {leaveIntent && (
-        <div className="fixed inset-0 z-[60] bg-black/65 flex items-center justify-center px-4">
+        <div className="fixed inset-0 z-60 bg-black/65 flex items-center justify-center px-4">
           <div className="w-full max-w-sm bg-bg-secondary border border-border rounded-xl shadow-xl p-5">
             <div className="flex items-start gap-3">
               <div className="w-9 h-9 rounded-full bg-accent/20 flex items-center justify-center shrink-0">

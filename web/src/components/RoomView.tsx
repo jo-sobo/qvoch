@@ -72,7 +72,7 @@ export function RoomView() {
   return (
     <div className="h-dvh flex flex-col bg-bg-primary">
       {reconnecting && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60]">
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-60">
           <div className="bg-bg-secondary border border-border rounded-lg p-6 flex items-center gap-3">
             <WifiOff className="w-5 h-5 text-accent animate-pulse" />
             <span className="text-text-primary">Reconnecting...</span>

@@ -6,24 +6,6 @@ import { UserPlus, X } from 'lucide-react';
 export function InviteModal() {
   const pendingInvite = useStore((s) => s.pendingInvite);
   const setPendingInvite = useStore((s) => s.setPendingInvite);
-  const [countdown, setCountdown] = useState(30);
-
-  useEffect(() => {
-    if (!pendingInvite) return;
-    setCountdown(30);
-
-    const timer = setInterval(() => {
-      setCountdown((c) => {
-        if (c <= 1) {
-          clearInterval(timer);
-          return 0;
-        }
-        return c - 1;
-      });
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [pendingInvite]);
 
   if (!pendingInvite) return null;
 
@@ -64,9 +46,7 @@ export function InviteModal() {
           .
         </p>
 
-        <div className="text-xs text-text-muted mb-4">
-          Expires in {countdown}s
-        </div>
+        <InviteCountdown key={pendingInvite.inviteId} />
 
         <div className="flex gap-3">
           <button
@@ -84,6 +64,30 @@ export function InviteModal() {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function InviteCountdown() {
+  const [countdown, setCountdown] = useState(30);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setCountdown((c) => {
+        if (c <= 1) {
+          window.clearInterval(timer);
+          return 0;
+        }
+        return c - 1;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="text-xs text-text-muted mb-4">
+      Expires in {countdown}s
     </div>
   );
 }

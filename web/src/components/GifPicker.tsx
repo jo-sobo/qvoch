@@ -10,34 +10,50 @@ interface GifPickerProps {
 export function GifPicker({ onSelect, onClose }: GifPickerProps) {
   const [query, setQuery] = useState('');
   const [gifs, setGifs] = useState<GifResult[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
-    setLoading(true);
-    getTrendingGifs(12)
-      .then(setGifs)
-      .finally(() => setLoading(false));
     inputRef.current?.focus();
   }, []);
 
   useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+    }
+    const requestId = ++requestIdRef.current;
+
+    const applyResults = (results: GifResult[]) => {
+      if (requestId !== requestIdRef.current) return;
+      setGifs(results);
+      setLoading(false);
+    };
+
+    const handleFailure = () => {
+      if (requestId !== requestIdRef.current) return;
+      setLoading(false);
+    };
+
     if (!query.trim()) {
-      getTrendingGifs(12).then(setGifs);
+      getTrendingGifs(12).then(applyResults).catch(handleFailure);
       return;
     }
+
     debounceRef.current = setTimeout(() => {
-      setLoading(true);
-      searchGifs(query, 12)
-        .then(setGifs)
-        .finally(() => setLoading(false));
+      searchGifs(query, 12).then(applyResults).catch(handleFailure);
     }, 300);
+
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, [query]);
+
+  const handleQueryChange = (value: string) => {
+    setLoading(true);
+    setQuery(value);
+  };
 
   return (
     <div className="absolute bottom-full right-0 mb-2 w-80 bg-bg-secondary border border-border rounded-lg shadow-xl z-50 overflow-hidden">
@@ -47,7 +63,7 @@ export function GifPicker({ onSelect, onClose }: GifPickerProps) {
           ref={inputRef}
           type="text"
           value={query}
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => handleQueryChange(e.target.value)}
           placeholder="Search GIFs..."
           className="flex-1 bg-transparent text-sm text-text-primary placeholder-text-muted focus:outline-none"
         />
