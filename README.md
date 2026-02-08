@@ -1,10 +1,9 @@
 # QVoCh
 
-[![Docker Image Version (latest semver)](https://img.shields.io/docker/v/josobo/qvoch?sort=semver)](https://hub.docker.com/repository/docker/josobo/qvoch/general)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-josobo%2Fqvoch-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/repository/docker/josobo/qvoch/general)
+[![GitHub](https://img.shields.io/badge/GitHub-jo--sobo%2Fqvoch-181717?logo=github&logoColor=white)](https://github.com/jo-sobo/qvoch)
 
 **Quick Voice Channel** — a self-hosted, ephemeral voice chat application. No accounts, no database, no tracking. Create a room, share the link, chat and talk.
-
-**Source code:** **[github.com/jo-sobo/qvoch](https://github.com/jo-sobo/qvoch)**
 
 ## Product Goal
 
