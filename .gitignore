@@ -8,7 +8,9 @@ Desktop.ini
 
 # Editors
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/css_custom_data.json
 *.swp
 *.swo
 *.code-workspace
