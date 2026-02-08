@@ -10,8 +10,13 @@ const rtcConfig: RTCConfiguration = {
 
 let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
+let captureStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let localAnalyser: AnalyserNode | null = null;
+let localManualMuted = false;
+let localVoiceGateOpen = true;
+
+const MAX_USER_VOLUME_MULTIPLIER = 2;
 
 type PendingCandidate = {
   ice: RTCIceCandidateInit;
@@ -29,25 +34,46 @@ let currentEpoch = 0;
 // needs to wait for local audio. Kept as exports for API compatibility.
 export function resetLocalAudioPromise(): void {}
 
-const remoteStreams = new Map<
-  string,
-  {
-    audio: HTMLAudioElement;
-    analyser: AnalyserNode | null;
-    gainNode: GainNode | null;
-    sourceNode: MediaStreamAudioSourceNode | null;
-  }
->();
+type RemoteStreamEntry = {
+  audio: HTMLAudioElement;
+  analyser: AnalyserNode | null;
+  gainNode: GainNode | null;
+  sourceNode: MediaStreamAudioSourceNode | null;
+  outputNode: MediaStreamAudioDestinationNode | null;
+  userGain: number;
+};
+
+const remoteStreams = new Map<string, RemoteStreamEntry>();
 
 type VolumeCallback = (volumes: Map<string, number>) => void;
-let volumeCallback: VolumeCallback | null = null;
+const volumeCallbacks = new Set<VolumeCallback>();
 let volumeAnimFrame: number | null = null;
 
 type LocalVolumeCallback = (volume: number) => void;
 let localVolumeCallback: LocalVolumeCallback | null = null;
 
+type VoiceTransmissionCallback = (active: boolean) => void;
+const voiceTransmissionCallbacks = new Set<VoiceTransmissionCallback>();
+let localTransmissionActive = false;
+
 export function setVolumeCallback(cb: VolumeCallback | null): void {
-  volumeCallback = cb;
+  volumeCallbacks.clear();
+  if (cb) {
+    volumeCallbacks.add(cb);
+    if (!volumeAnimFrame) {
+      startVolumeMonitoring();
+    }
+  }
+}
+
+export function subscribeVolumeCallback(cb: VolumeCallback): () => void {
+  volumeCallbacks.add(cb);
+  if (!volumeAnimFrame) {
+    startVolumeMonitoring();
+  }
+  return () => {
+    volumeCallbacks.delete(cb);
+  };
 }
 
 export function setLocalVolumeCallback(cb: LocalVolumeCallback | null): void {
@@ -55,6 +81,97 @@ export function setLocalVolumeCallback(cb: LocalVolumeCallback | null): void {
   if (cb && !volumeAnimFrame) {
     startVolumeMonitoring();
   }
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function volumePercentToGain(volume: number): number {
+  return clamp(volume / 100, 0, MAX_USER_VOLUME_MULTIPLIER);
+}
+
+function applyLocalTrackState(): void {
+  if (!localStream) {
+    setLocalTransmissionState(false);
+    return;
+  }
+  const enabled = !localManualMuted && localVoiceGateOpen;
+  for (const track of localStream.getAudioTracks()) {
+    track.enabled = enabled;
+  }
+  setLocalTransmissionState(enabled && localStream.getAudioTracks().length > 0);
+}
+
+function setLocalTransmissionState(active: boolean): void {
+  if (localTransmissionActive === active) return;
+  localTransmissionActive = active;
+  for (const cb of voiceTransmissionCallbacks) {
+    cb(active);
+  }
+}
+
+function applyAudioOutputDevice(audio: HTMLAudioElement, deviceId: string | null): void {
+  if (deviceId == null || !('setSinkId' in audio)) return;
+  (audio as HTMLAudioElement & { setSinkId(id: string): Promise<void> })
+    .setSinkId(deviceId)
+    .catch((err) => console.error('Failed to set output device:', err));
+}
+
+function setEntryGain(entry: RemoteStreamEntry, gain: number): void {
+  entry.userGain = clamp(gain, 0, MAX_USER_VOLUME_MULTIPLIER);
+  if (entry.gainNode) {
+    entry.gainNode.gain.value = entry.userGain;
+    entry.audio.volume = 1;
+    return;
+  }
+  entry.audio.volume = clamp(entry.userGain, 0, 1);
+}
+
+function buildRemoteAudioGraph(entry: RemoteStreamEntry, stream: MediaStream): void {
+  entry.sourceNode?.disconnect();
+  entry.gainNode?.disconnect();
+  entry.outputNode?.disconnect();
+  entry.sourceNode = null;
+  entry.gainNode = null;
+  entry.outputNode = null;
+  entry.analyser = null;
+  entry.audio.srcObject = stream;
+
+  if (!audioContext) return;
+
+  try {
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    const gainNode = audioContext.createGain();
+    const outputNode = audioContext.createMediaStreamDestination();
+
+    sourceNode.connect(analyser);
+    sourceNode.connect(gainNode);
+    gainNode.connect(outputNode);
+
+    entry.sourceNode = sourceNode;
+    entry.analyser = analyser;
+    entry.gainNode = gainNode;
+    entry.outputNode = outputNode;
+    entry.audio.srcObject = outputNode.stream;
+  } catch {
+    // no-op; fallback is direct audio element playback
+  }
+}
+
+function configureRemoteEntry(entry: RemoteStreamEntry, streamId: string, stream: MediaStream): void {
+  ensureAudioContext();
+  buildRemoteAudioGraph(entry, stream);
+
+  const userId = extractUserIdFromStreamId(streamId);
+  const { userVolumes, outputMuted, audioOutputDeviceId } = useStore.getState();
+  const volumePct = userId && userVolumes[userId] != null ? userVolumes[userId] : 100;
+  setEntryGain(entry, volumePercentToGain(volumePct));
+  entry.audio.muted = outputMuted;
+  applyAudioOutputDevice(entry.audio, audioOutputDeviceId);
+  entry.audio.play().catch(() => {});
 }
 
 export async function initLocalAudio(deviceId?: string | null): Promise<MediaStream> {
@@ -72,25 +189,30 @@ export async function initLocalAudio(deviceId?: string | null): Promise<MediaStr
     video: false,
   };
 
-  const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+  const newCaptureStream = await navigator.mediaDevices.getUserMedia(constraints);
 
+  if (captureStream && deviceId) {
+    for (const track of captureStream.getAudioTracks()) {
+      track.stop();
+    }
+  }
   if (localStream && deviceId) {
     for (const track of localStream.getAudioTracks()) {
       track.stop();
     }
   }
 
-  localStream = newStream;
+  captureStream = newCaptureStream;
+  const captureTrack = newCaptureStream.getAudioTracks()[0];
+  localStream = captureTrack ? new MediaStream([captureTrack.clone()]) : new MediaStream();
 
-  const isMuted = useStore.getState().muted;
-  for (const track of newStream.getAudioTracks()) {
-    track.enabled = !isMuted;
-  }
+  localManualMuted = useStore.getState().muted;
+  applyLocalTrackState();
 
   ensureAudioContext();
   if (audioContext) {
     try {
-      const source = audioContext.createMediaStreamSource(newStream);
+      const source = audioContext.createMediaStreamSource(newCaptureStream);
       localAnalyser = audioContext.createAnalyser();
       localAnalyser.fftSize = 256;
       source.connect(localAnalyser);
@@ -249,6 +371,8 @@ function createPeerConnection(): void {
     entry.audio.pause();
     entry.audio.srcObject = null;
     entry.sourceNode?.disconnect();
+    entry.gainNode?.disconnect();
+    entry.outputNode?.disconnect();
   }
   remoteStreams.clear();
 
@@ -278,58 +402,25 @@ function createPeerConnection(): void {
 
     if (remoteStreams.has(streamId)) {
       const existing = remoteStreams.get(streamId)!;
-      existing.audio.srcObject = stream;
-      const userId = extractUserIdFromStreamId(streamId);
-      const { userVolumes, outputMuted } = useStore.getState();
-      const vol = userId && userVolumes[userId] != null ? userVolumes[userId] / 100 : 1.0;
-      existing.audio.volume = Math.max(0, Math.min(1, vol));
-      existing.audio.muted = outputMuted;
-      existing.audio.play().catch(() => {});
-
-      if (existing.sourceNode && audioContext) {
-        try {
-          existing.sourceNode.disconnect();
-          const newSource = audioContext.createMediaStreamSource(stream);
-          if (existing.analyser) {
-            newSource.connect(existing.analyser);
-          }
-          existing.sourceNode = newSource;
-        } catch {
-          // no-op
-        }
-      }
+      configureRemoteEntry(existing, streamId, stream);
 
       attachTrackLifecycle(event.track, streamId);
       return;
     }
 
-    ensureAudioContext();
-
-    let analyser: AnalyserNode | null = null;
-    let gainNode: GainNode | null = null;
-    let sourceNode: MediaStreamAudioSourceNode | null = null;
     const audio = new Audio();
-    audio.srcObject = stream;
     audio.autoplay = true;
-    const userId = extractUserIdFromStreamId(streamId);
-    const { userVolumes, outputMuted } = useStore.getState();
-    const vol = userId && userVolumes[userId] != null ? userVolumes[userId] / 100 : 1.0;
-    audio.volume = Math.max(0, Math.min(1, vol));
-    audio.muted = outputMuted;
-    audio.play().catch(() => {});
+    const entry: RemoteStreamEntry = {
+      audio,
+      analyser: null,
+      gainNode: null,
+      sourceNode: null,
+      outputNode: null,
+      userGain: 1,
+    };
 
-    if (audioContext) {
-      try {
-        sourceNode = audioContext.createMediaStreamSource(stream);
-        analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        sourceNode.connect(analyser);
-      } catch {
-        // no-op
-      }
-    }
-
-    remoteStreams.set(streamId, { audio, analyser, gainNode, sourceNode });
+    configureRemoteEntry(entry, streamId, stream);
+    remoteStreams.set(streamId, entry);
     attachTrackLifecycle(event.track, streamId);
 
     if (!volumeAnimFrame) {
@@ -349,6 +440,8 @@ function attachTrackLifecycle(track: MediaStreamTrack, streamId: string): void {
       entry.audio.pause();
       entry.audio.srcObject = null;
       entry.sourceNode?.disconnect();
+      entry.gainNode?.disconnect();
+      entry.outputNode?.disconnect();
       remoteStreams.delete(streamId);
     }
   };
@@ -363,7 +456,7 @@ function extractUserIdFromStreamId(streamId: string): string | null {
 
 function startVolumeMonitoring(): void {
   const check = () => {
-    if (volumeCallback && remoteStreams.size > 0) {
+    if (volumeCallbacks.size > 0 && remoteStreams.size > 0) {
       const volumes = new Map<string, number>();
       for (const [streamId, { analyser }] of remoteStreams) {
         if (!analyser) continue;
@@ -372,7 +465,9 @@ function startVolumeMonitoring(): void {
         const avg = data.reduce((sum, val) => sum + val, 0) / data.length;
         volumes.set(streamId, avg);
       }
-      volumeCallback(volumes);
+      for (const cb of volumeCallbacks) {
+        cb(volumes);
+      }
     }
 
     if (localVolumeCallback && localAnalyser) {
@@ -388,11 +483,13 @@ function startVolumeMonitoring(): void {
 }
 
 export function setMuted(muted: boolean): void {
-  if (localStream) {
-    for (const track of localStream.getAudioTracks()) {
-      track.enabled = !muted;
-    }
-  }
+  localManualMuted = muted;
+  applyLocalTrackState();
+}
+
+export function setVoiceTransmissionActive(active: boolean): void {
+  localVoiceGateOpen = active;
+  applyLocalTrackState();
 }
 
 export function setOutputMuted(muted: boolean): void {
@@ -403,11 +500,7 @@ export function setOutputMuted(muted: boolean): void {
 
 export function setOutputDevice(deviceId: string): void {
   for (const [, { audio }] of remoteStreams) {
-    if ('setSinkId' in audio) {
-      (audio as HTMLAudioElement & { setSinkId(id: string): Promise<void> })
-        .setSinkId(deviceId)
-        .catch((err) => console.error('Failed to set output device:', err));
-    }
+    applyAudioOutputDevice(audio, deviceId);
   }
 }
 
@@ -415,7 +508,7 @@ export function setUserVolume(userId: string, volume: number): void {
   const streamId = `stream-${userId}`;
   const entry = remoteStreams.get(streamId);
   if (entry) {
-    entry.audio.volume = Math.max(0, Math.min(1, volume / 100));
+    setEntryGain(entry, volumePercentToGain(volume));
   }
 }
 
@@ -424,6 +517,18 @@ export function getLocalVolume(): number {
   const data = new Uint8Array(localAnalyser.frequencyBinCount);
   localAnalyser.getByteFrequencyData(data);
   return data.reduce((sum, val) => sum + val, 0) / data.length;
+}
+
+export function getVoiceTransmissionActive(): boolean {
+  return localTransmissionActive;
+}
+
+export function subscribeVoiceTransmissionCallback(cb: VoiceTransmissionCallback): () => void {
+  voiceTransmissionCallbacks.add(cb);
+  cb(localTransmissionActive);
+  return () => {
+    voiceTransmissionCallbacks.delete(cb);
+  };
 }
 
 export function closeWebRTC(): void {
@@ -436,6 +541,8 @@ export function closeWebRTC(): void {
     entry.audio.pause();
     entry.audio.srcObject = null;
     entry.sourceNode?.disconnect();
+    entry.gainNode?.disconnect();
+    entry.outputNode?.disconnect();
   }
   remoteStreams.clear();
 
@@ -450,8 +557,17 @@ export function closeWebRTC(): void {
     }
     localStream = null;
   }
+  if (captureStream) {
+    for (const track of captureStream.getTracks()) {
+      track.stop();
+    }
+    captureStream = null;
+  }
 
   localAnalyser = null;
+  localManualMuted = false;
+  localVoiceGateOpen = true;
+  setLocalTransmissionState(false);
 
   if (audioContext) {
     audioContext.close();

@@ -1,4 +1,7 @@
-const API_KEY = import.meta.env.VITE_GIPHY_API_KEY || '';
+import { getRuntimeGiphyApiKey } from './runtimeConfig';
+
+const runtimeApiKey = getRuntimeGiphyApiKey();
+const API_KEY = runtimeApiKey || import.meta.env.VITE_GIPHY_API_KEY || '';
 const BASE_URL = 'https://api.giphy.com/v1/gifs';
 
 export interface GifResult {

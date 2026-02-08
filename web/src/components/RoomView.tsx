@@ -97,10 +97,10 @@ export function RoomView() {
         </div>
       )}
 
-      <div className="flex items-center justify-between px-5 py-2.5 bg-bg-secondary/80 border-b border-border/40">
-        <div className="flex items-center gap-3">
+      <div className="grid grid-cols-[1fr_auto_1fr] items-center px-5 py-2.5 bg-bg-secondary/80 border-b border-border/40 gap-3">
+        <div className="flex items-center gap-3 min-w-0">
           <Headphones className="w-5 h-5 text-accent" />
-          <div>
+          <div className="min-w-0">
             <h1 className="text-sm font-semibold text-text-primary leading-tight">
               {roomFullName}
             </h1>
@@ -111,7 +111,7 @@ export function RoomView() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="justify-self-center">
           <button
             onClick={handleCopyLink}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-accent/10 hover:bg-accent/20 border border-accent/20 rounded-md text-xs font-medium text-accent hover:text-accent-hover transition-colors"
@@ -124,14 +124,14 @@ export function RoomView() {
             )}
             <span className="hidden sm:inline">Invite Link</span>
           </button>
+        </div>
 
-          <div className="flex items-center gap-1">
-            {connected ? (
-              <Wifi className="w-4 h-4 text-success" />
-            ) : (
-              <WifiOff className="w-4 h-4 text-red-400" />
-            )}
-          </div>
+        <div className="justify-self-end flex items-center gap-1">
+          {connected ? (
+            <Wifi className="w-4 h-4 text-success" />
+          ) : (
+            <WifiOff className="w-4 h-4 text-red-400" />
+          )}
         </div>
       </div>
 
@@ -175,8 +175,11 @@ export function RoomView() {
 
         <div
           onMouseDown={handleDividerMouseDown}
-          className="w-px bg-border/30 hover:bg-accent/50 hover:w-0.5 cursor-col-resize transition-colors shrink-0"
-        />
+          className="relative w-8 -mx-4 shrink-0 cursor-col-resize group touch-none z-10"
+        >
+          <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-px bg-border/30 group-hover:bg-accent/50 transition-colors pointer-events-none" />
+          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 h-11 w-1.5 rounded-full bg-border/70 group-hover:bg-accent/80 transition-colors pointer-events-none" />
+        </div>
 
         <div className="flex-1 flex flex-col min-w-0">
           <ChatPanel />

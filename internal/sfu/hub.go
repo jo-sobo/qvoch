@@ -38,6 +38,7 @@ type Hub struct {
 	mu             sync.RWMutex
 
 	webrtcAPI        *webrtc.API
+	webrtcCfg        WebRTCConfig
 	maxUsersPerRoom  int
 	maxTotalRooms    int
 	chatHistorySize  int
@@ -67,6 +68,7 @@ func GetHub() *Hub {
 
 		log.Printf("Hub: maxUsersPerRoom=%d maxRooms=%d chatHistorySize=%d", maxUsers, maxRooms, chatSize)
 		go hub.startGC()
+		go hub.startPublicIPMonitor()
 	})
 	return hub
 }

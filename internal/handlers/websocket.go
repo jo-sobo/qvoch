@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/jonas/qvoch/internal/sfu"
+	"github.com/jo-sobo/qvoch/internal/sfu"
 )
 
 var allowedOrigins map[string]bool

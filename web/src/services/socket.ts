@@ -28,7 +28,6 @@ function initBroadcastChannel(): void {
     if (event.data === 'active') {
       const store = useStore.getState();
       if (store.roomId) {
-        store.addToast('Connected in another tab. This tab will be disconnected.');
         disconnect();
         closeWebRTC();
         store.reset();
@@ -75,6 +74,14 @@ function getReconnectDelay(): number {
   const delays = [1000, 2000, 4000, 8000];
   const delay = delays[Math.min(reconnectAttempts, delays.length - 1)];
   return Math.min(delay, 30000);
+}
+
+function clearPersistedRejoinState(): void {
+  localStorage.removeItem('sessionToken');
+  localStorage.removeItem('qvoch-session-token');
+  localStorage.removeItem('qvoch-session-time');
+  localStorage.removeItem('qvoch-session-username');
+  localStorage.removeItem('qvoch-session-invite');
 }
 
 export function connect(): void {
@@ -197,6 +204,7 @@ function handleMessage(type: string, payload: unknown): void {
       store.updateUsers(p.roomState.users, p.roomState.subChannels);
 
       localStorage.setItem('sessionToken', p.sessionToken);
+      localStorage.setItem('qvoch-session-token', p.sessionToken);
       pendingSessionFallback = null;
 
       if (p.reconnectNotice) {
@@ -240,7 +248,16 @@ function handleMessage(type: string, payload: unknown): void {
         });
       }
 
-      window.location.hash = `#/room/${p.roomState.id}`;
+      persistSessionForRejoin();
+
+      const targetHash = `#/room/${p.roomState.id}`;
+      if (window.location.hash !== targetHash) {
+        window.location.hash = targetHash;
+      } else {
+        // When hash is unchanged (e.g. page reload on same room route),
+        // explicitly notify listeners so UI routing can sync to room view.
+        window.dispatchEvent(new Event('hashchange'));
+      }
       break;
     }
 
@@ -428,13 +445,29 @@ async function deriveE2EKey(roomFullName: string): Promise<CryptoKey | null> {
 
 export function persistSessionForRejoin(): void {
   const store = useStore.getState();
-  if (store.roomId) {
+  if (store.roomId && store.username) {
     localStorage.setItem('qvoch-session-time', String(Date.now()));
     localStorage.setItem('qvoch-session-username', store.username);
+    if (store.sessionToken) {
+      localStorage.setItem('sessionToken', store.sessionToken);
+      localStorage.setItem('qvoch-session-token', store.sessionToken);
+    }
     if (store.inviteToken) {
       localStorage.setItem('qvoch-session-invite', store.inviteToken);
+    } else {
+      localStorage.removeItem('qvoch-session-invite');
     }
   }
+}
+
+export function leaveRoomAndReset(): void {
+  send('leave', {});
+  closeWebRTC();
+  disconnect();
+  clearPersistedRejoinState();
+  sessionStorage.removeItem('qvoch-password');
+  useStore.getState().reset();
+  window.location.hash = '#/';
 }
 
 if ('BroadcastChannel' in window) {

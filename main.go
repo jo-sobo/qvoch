@@ -6,15 +6,31 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
-	"github.com/jonas/qvoch/internal/handlers"
-	_ "github.com/jonas/qvoch/internal/sfu"
+	"github.com/jo-sobo/qvoch/internal/handlers"
+	_ "github.com/jo-sobo/qvoch/internal/sfu"
 )
 
-const serverBuildID = "2026-02-08-webrtc-debug-6"
+const (
+	buildTimeLayout        = "20060102-150405"
+	buildPrefixNonOfficial = "non-official"
+	buildPrefixOfficial    = "official"
+)
+
+var (
+	// Optional full override supplied via ldflags: -X main.serverBuildID=...
+	serverBuildID = ""
+	// Recommended ldflags metadata inputs.
+	buildBranch = ""
+	buildCommit = ""
+	buildTime   = ""
+)
 
 func main() {
 	port := os.Getenv("PORT")
@@ -31,7 +47,7 @@ func main() {
 	handler = sitePassphraseMiddleware(handler)
 
 	addr := fmt.Sprintf(":%s", port)
-	log.Printf("QVoCh server starting on %s (build=%s)", addr, serverBuildID)
+	log.Printf("QVoCh server starting on %s (build=%s)", addr, resolveServerBuildID())
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
@@ -48,6 +64,133 @@ func init() {
 		authToken = uuid.New().String()
 		log.Printf("Site passphrase enabled — auth required")
 	}
+}
+
+func resolveServerBuildID() string {
+	if override := strings.TrimSpace(serverBuildID); override != "" {
+		return normalizeBuildID(override)
+	}
+
+	branch := sanitizeBuildToken(buildBranch, "unknown")
+	commit := sanitizeCommit(buildCommit)
+	timePart := normalizeBuildTime(buildTime)
+	dirty := false
+
+	if info, ok := debug.ReadBuildInfo(); ok {
+		settings := make(map[string]string, len(info.Settings))
+		for _, s := range info.Settings {
+			settings[s.Key] = s.Value
+		}
+
+		if branch == "unknown" {
+			if vcsBranch := sanitizeBuildToken(settings["vcs.branch"], ""); vcsBranch != "" {
+				branch = vcsBranch
+			}
+		}
+		if commit == "" {
+			commit = sanitizeCommit(settings["vcs.revision"])
+		}
+		if timePart == "" {
+			timePart = normalizeBuildTime(settings["vcs.time"])
+		}
+		dirty = strings.EqualFold(strings.TrimSpace(settings["vcs.modified"]), "true")
+	}
+
+	if commit == "" {
+		commit = "nogit"
+	}
+	if timePart == "" {
+		timePart = "notime"
+	}
+
+	id := fmt.Sprintf("%s-%s-%s", branch, commit, timePart)
+	if dirty {
+		id += "-dirty"
+	}
+	return normalizeBuildID(id)
+}
+
+func normalizeBuildID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return buildPrefixNonOfficial + "-unknown-nogit-notime"
+	}
+
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, buildPrefixOfficial+"-") || strings.HasPrefix(lower, buildPrefixNonOfficial+"-") {
+		return raw
+	}
+
+	return buildPrefixNonOfficial + "-" + raw
+}
+
+func sanitizeBuildToken(raw string, fallback string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return fallback
+	}
+
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastDash := false
+
+	for _, r := range raw {
+		if unicode.IsDigit(r) || unicode.IsLetter(r) || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+
+	cleaned := strings.Trim(b.String(), "-")
+	if cleaned == "" {
+		return fallback
+	}
+	return cleaned
+}
+
+func sanitizeCommit(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return ""
+	}
+	if len(raw) > 12 {
+		raw = raw[:12]
+	}
+
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func normalizeBuildTime(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+		return parsed.UTC().Format(buildTimeLayout)
+	}
+
+	if parsed, err := time.Parse(buildTimeLayout, raw); err == nil {
+		return parsed.UTC().Format(buildTimeLayout)
+	}
+
+	if unixSec, err := strconv.ParseInt(raw, 10, 64); err == nil && unixSec > 0 {
+		return time.Unix(unixSec, 0).UTC().Format(buildTimeLayout)
+	}
+
+	return ""
 }
 
 func sitePassphraseMiddleware(next http.Handler) http.Handler {

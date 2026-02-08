@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import { useStore } from '../stores/useStore';
 import { switchAudioInput, setOutputMuted, setOutputDevice, setLocalVolumeCallback } from '../services/webrtc';
 import { X, Sun, Moon, Mic, Volume2 } from 'lucide-react';
+import { AppBuildFooter } from './AppBuildFooter';
 
 interface AudioDevice {
   deviceId: string;
@@ -45,6 +46,7 @@ export function SettingsPanel() {
             .map((d) => ({ deviceId: d.deviceId, label: d.label || `Speaker ${d.deviceId.slice(0, 8)}` }))
         );
       } catch {
+        // Device enumeration may fail until permissions are granted.
       }
     }
 
@@ -86,7 +88,7 @@ export function SettingsPanel() {
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setSettingsOpen(false)}>
       <div
-        className="bg-bg-secondary border border-border rounded-lg w-full max-w-md max-h-[80dvh] overflow-y-auto"
+        className="bg-bg-secondary border border-border rounded-lg w-full max-w-lg max-h-[85dvh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-border">
@@ -96,9 +98,12 @@ export function SettingsPanel() {
           </button>
         </div>
 
-        <div className="p-5 space-y-6">
-          <section>
-            <h3 className="text-sm font-medium text-text-secondary mb-3">Appearance</h3>
+        <div className="p-5 space-y-4">
+          <SettingsCard
+            title="Appearance"
+            description="Visual preferences"
+            icon={<Sun className="w-4 h-4" />}
+          >
             <div className="flex items-center justify-between">
               <span className="text-sm text-text-primary">Theme</span>
               <div className="flex items-center gap-2 bg-bg-tertiary rounded-md p-1">
@@ -120,12 +125,14 @@ export function SettingsPanel() {
                 </button>
               </div>
             </div>
-          </section>
+          </SettingsCard>
 
-          <section>
-            <h3 className="text-sm font-medium text-text-secondary mb-3 flex items-center gap-2">
-              <Mic className="w-4 h-4" /> Audio Input
-            </h3>
+          <SettingsCard
+            title="Voice Input"
+            description="Microphone and level monitoring"
+            icon={<Mic className="w-4 h-4" />}
+          >
+            <label className="block text-xs text-text-muted mb-1">Microphone</label>
             <select
               value={audioInputDeviceId || ''}
               onChange={(e) => handleInputDeviceChange(e.target.value)}
@@ -142,23 +149,57 @@ export function SettingsPanel() {
               vadThreshold={vadThreshold}
               setVadThreshold={setVadThreshold}
             />
-          </section>
+          </SettingsCard>
 
-          <section>
-            <h3 className="text-sm font-medium text-text-secondary mb-3 flex items-center gap-2">
-              <Volume2 className="w-4 h-4" /> Audio Output
-            </h3>
-            {outputDevices.length > 0 && (
-              <select
-                value={audioOutputDeviceId || ''}
-                onChange={(e) => handleOutputDeviceChange(e.target.value)}
-                className="w-full px-3 py-2 bg-bg-input border border-border rounded-md text-sm text-text-primary focus:outline-none focus:border-accent"
+          <SettingsCard
+            title="Voice Transmission"
+            description="Choose how your voice is sent"
+            icon={<Mic className="w-4 h-4" />}
+          >
+            <div className="flex items-center gap-2 bg-bg-tertiary rounded-md p-1">
+              <button
+                onClick={() => setVoiceMode('vad')}
+                className={`flex-1 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                  voiceMode === 'vad' ? 'bg-accent text-white' : 'text-text-muted hover:text-text-primary'
+                }`}
               >
-                <option value="">Default</option>
-                {outputDevices.map((d) => (
-                  <option key={d.deviceId} value={d.deviceId}>{d.label}</option>
-                ))}
-              </select>
+                Voice Activation
+              </button>
+              <button
+                onClick={() => setVoiceMode('ptt')}
+                className={`flex-1 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                  voiceMode === 'ptt' ? 'bg-accent text-white' : 'text-text-muted hover:text-text-primary'
+                  }`}
+              >
+                Push to Talk
+              </button>
+            </div>
+            {voiceMode === 'ptt' && (
+              <p className="text-xs text-text-muted mt-3">
+                Hold <kbd className="px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-text-secondary">Space</kbd> to talk
+              </p>
+            )}
+          </SettingsCard>
+
+          <SettingsCard
+            title="Audio Output"
+            description="Speaker routing and output mute"
+            icon={<Volume2 className="w-4 h-4" />}
+          >
+            {outputDevices.length > 0 && (
+              <>
+                <label className="block text-xs text-text-muted mb-1">Speaker</label>
+                <select
+                  value={audioOutputDeviceId || ''}
+                  onChange={(e) => handleOutputDeviceChange(e.target.value)}
+                  className="w-full px-3 py-2 bg-bg-input border border-border rounded-md text-sm text-text-primary focus:outline-none focus:border-accent"
+                >
+                  <option value="">Default</option>
+                  {outputDevices.map((d) => (
+                    <option key={d.deviceId} value={d.deviceId}>{d.label}</option>
+                  ))}
+                </select>
+              </>
             )}
             <div className="mt-3 flex items-center justify-between">
               <span className="text-sm text-text-primary">Mute Output</span>
@@ -175,38 +216,39 @@ export function SettingsPanel() {
                 />
               </button>
             </div>
-          </section>
+          </SettingsCard>
+        </div>
 
-          <section>
-            <h3 className="text-sm font-medium text-text-secondary mb-3">Voice Mode</h3>
-            <div className="flex items-center gap-2 bg-bg-tertiary rounded-md p-1">
-              <button
-                onClick={() => setVoiceMode('vad')}
-                className={`flex-1 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  voiceMode === 'vad' ? 'bg-accent text-white' : 'text-text-muted hover:text-text-primary'
-                }`}
-              >
-                Voice Activation
-              </button>
-              <button
-                onClick={() => setVoiceMode('ptt')}
-                className={`flex-1 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  voiceMode === 'ptt' ? 'bg-accent text-white' : 'text-text-muted hover:text-text-primary'
-                }`}
-              >
-                Push to Talk
-              </button>
-            </div>
-
-            {voiceMode === 'ptt' && (
-              <p className="text-xs text-text-muted mt-3">
-                Hold <kbd className="px-1.5 py-0.5 bg-bg-tertiary border border-border rounded text-text-secondary">Space</kbd> to talk
-              </p>
-            )}
-          </section>
+        <div className="px-5 py-3 border-t border-border bg-bg-primary/35">
+          <AppBuildFooter compact />
         </div>
       </div>
     </div>
+  );
+}
+
+function SettingsCard({
+  title,
+  description,
+  icon,
+  children,
+}: {
+  title: string;
+  description: string;
+  icon: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="rounded-lg border border-border bg-bg-primary/20 p-4">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <h3 className="text-sm font-medium text-text-primary">{title}</h3>
+          <p className="text-xs text-text-muted mt-0.5">{description}</p>
+        </div>
+        <div className="text-text-secondary">{icon}</div>
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -276,11 +318,10 @@ function CombinedVADBar({
 
         {voiceMode === 'vad' && (
           <div
-            className="absolute top-0 h-full flex items-center"
+            className="absolute top-0 h-full"
             style={{ left: `${vadThreshold}%`, transform: 'translateX(-50%)' }}
           >
-            <div className="w-0.5 h-full bg-accent" />
-            <div className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-accent border-2 border-bg-secondary shadow" />
+            <div className="w-0.5 h-full bg-accent shadow-[0_0_0_1px_rgba(14,165,233,0.2)]" />
           </div>
         )}
       </div>
