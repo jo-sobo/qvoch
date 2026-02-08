@@ -20,10 +20,15 @@ type Peer struct {
 	Track            *webrtc.TrackLocalStaticRTP
 	RoomID           string // Current room (main or sub-channel ID)
 	MainRoomID       string // Always the main channel ID
-	Muted              bool
-	NeedsRenegotiation bool
-	mu                 sync.RWMutex
-	writeMu            sync.Mutex
+	Muted            bool
+	OfferSeq         uint64
+	Epoch            uint64
+	pendingRenego    bool
+	signalingReady   chan struct{}
+	iceRestartQueued bool
+	mu               sync.RWMutex
+	writeMu          sync.Mutex
+	negoMu           sync.Mutex
 }
 
 func (p *Peer) RLock()   { p.mu.RLock() }

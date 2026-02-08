@@ -16,6 +16,7 @@ import type { User } from '../types';
 let ws: WebSocket | null = null;
 let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSessionFallback: { username: string; inviteToken: string } | null = null;
 
 let sessionChannel: BroadcastChannel | null = null;
 
@@ -97,13 +98,21 @@ export function connect(): void {
 
     // Auto-rejoin room after WebSocket reconnect.
     // Init audio first so local tracks are available when the offer arrives.
-    if (store.roomId && store.username && store.inviteToken) {
-      const { username, inviteToken, audioInputDeviceId } = store;
+    if (store.roomId && store.username) {
+      const { username, sessionToken, inviteToken, audioInputDeviceId } = store;
       resetLocalAudioPromise();
       initLocalAudio(audioInputDeviceId)
         .catch(() => {})
         .then(() => {
-          send('join', { username, inviteToken });
+          if (sessionToken) {
+            if (inviteToken) {
+              pendingSessionFallback = { username, inviteToken };
+            }
+            send('join', { username, sessionToken });
+          } else if (inviteToken) {
+            pendingSessionFallback = null;
+            send('join', { username, inviteToken });
+          }
         });
     }
   };
@@ -150,6 +159,7 @@ function scheduleReconnect(): void {
 }
 
 export function disconnect(): void {
+  pendingSessionFallback = null;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -187,6 +197,11 @@ function handleMessage(type: string, payload: unknown): void {
       store.updateUsers(p.roomState.users, p.roomState.subChannels);
 
       localStorage.setItem('sessionToken', p.sessionToken);
+      pendingSessionFallback = null;
+
+      if (p.reconnectNotice) {
+        store.addToast(p.reconnectNotice);
+      }
 
       sessionChannel?.postMessage('active');
 
@@ -232,6 +247,18 @@ function handleMessage(type: string, payload: unknown): void {
     case 'error': {
       const p = payload as ErrorPayload;
       console.error(`Server error [${p.code}]: ${p.message}`);
+
+      if (
+        pendingSessionFallback
+        && (p.code === 'INVALID_MESSAGE' || p.code === 'CHANNEL_NOT_FOUND')
+      ) {
+        const fallback = pendingSessionFallback;
+        pendingSessionFallback = null;
+        send('join', { username: fallback.username, inviteToken: fallback.inviteToken });
+        store.addToast('Session expired, rejoining via invite token...');
+        break;
+      }
+
       store.addToast(`Error: ${p.message}`);
       break;
     }
@@ -310,13 +337,13 @@ function handleMessage(type: string, payload: unknown): void {
 
     case 'offer': {
       const p = payload as OfferPayload;
-      handleOffer(p.sdp, p.reset).catch((err) => console.error('Failed to handle offer:', err));
+      handleOffer(p.sdp, p.reset, p.seq, p.epoch);
       break;
     }
 
     case 'candidate': {
       const p = payload as CandidatePayload;
-      handleRTCCandidate(p.candidate, p.sdpMid, p.sdpMLineIndex);
+      handleRTCCandidate(p.candidate, p.sdpMid, p.sdpMLineIndex, p.seq, p.epoch);
       break;
     }
 

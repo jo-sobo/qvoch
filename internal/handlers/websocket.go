@@ -192,7 +192,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		close(pingDone)
 		hub := sfu.GetHub()
-		hub.RemovePeer(peer)
+		hub.RemovePeer(peer, true)
 		conn.Close()
 		log.Printf("peer disconnected: %s", peerID)
 	}()
@@ -254,7 +254,7 @@ func HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		case "move-to-sub":
 			handleMoveToSub(hub, peer, env.Payload)
 		case "leave":
-			hub.RemovePeer(peer)
+			hub.RemovePeer(peer, false)
 		default:
 			peer.SendError(sfu.ErrInvalidMessage, "Unknown message type: "+env.Type)
 		}
@@ -320,16 +320,18 @@ func handleCreate(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage, ip stri
 	sessionToken := peer.SessionToken
 	peer.RUnlock()
 
-	welcome := hub.BuildWelcomePayload(peer, room, sessionToken)
+	welcome := hub.BuildWelcomePayload(peer, room, sessionToken, "")
 	peer.SendJSON("welcome", welcome)
 
 	if err := hub.CreatePeerConnection(peer, room); err != nil {
 		log.Printf("failed to create peer connection for %s: %v", peer.ID, err)
 		return
 	}
-	if err := hub.SendOffer(peer); err != nil {
-		log.Printf("failed to send offer to %s: %v", peer.ID, err)
-	}
+	go func() {
+		if err := hub.NegotiateOffer(peer, true); err != nil {
+			log.Printf("failed to send offer to %s: %v", peer.ID, err)
+		}
+	}()
 }
 
 func handleJoin(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage, ip string) {
@@ -356,7 +358,7 @@ func handleJoin(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage, ip string
 		return
 	}
 
-	room, sessionToken, err := hub.JoinRoom(p, peer)
+	room, sessionToken, reconnectNotice, err := hub.JoinRoom(p, peer)
 	if err != nil {
 		errMsg := err.Error()
 		code := sfu.ErrInternalError
@@ -375,7 +377,9 @@ func handleJoin(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage, ip string
 		return
 	}
 
-	welcome := hub.BuildWelcomePayload(peer, room, sessionToken)
+	log.Printf("peer %s: join from ip=%s", peer.ID, ip)
+
+	welcome := hub.BuildWelcomePayload(peer, room, sessionToken, reconnectNotice)
 	peer.SendJSON("welcome", welcome)
 
 	hub.RemoveTrackFromPeers(peer, room)
@@ -385,9 +389,18 @@ func handleJoin(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage, ip string
 		log.Printf("failed to create peer connection for %s: %v", peer.ID, err)
 	} else {
 		hub.AddTrackToPeers(peer, room)
-		if err := hub.SendOffer(peer); err != nil {
-			log.Printf("failed to send offer to %s: %v", peer.ID, err)
-		}
+		go func(target *sfu.Peer, targetRoom *sfu.Room) {
+			if err := hub.NegotiateOffer(target, true); err != nil {
+				log.Printf("failed to send initial offer to %s: %v", target.ID, err)
+				return
+			}
+
+			if hub.AddRoomTracksToPeer(target, targetRoom) {
+				if err := hub.NegotiateOffer(target, false); err != nil {
+					log.Printf("failed to send room-track offer to %s: %v", target.ID, err)
+				}
+			}
+		}(peer, room)
 	}
 
 	hub.BroadcastRoomUpdatePublic(room)
@@ -421,7 +434,7 @@ func handleAnswer(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage) {
 		return
 	}
 
-	if err := hub.HandleAnswer(peer, p.SDP); err != nil {
+	if err := hub.HandleAnswer(peer, p.SDP, p.Seq, p.Epoch); err != nil {
 		log.Printf("peer %s: handle answer error: %v", peer.ID, err)
 	}
 }
@@ -439,7 +452,7 @@ func handleCandidate(hub *sfu.Hub, peer *sfu.Peer, payload json.RawMessage) {
 		return
 	}
 
-	if err := hub.HandleICECandidate(peer, p.Candidate, p.SDPMid, p.SDPMLineIndex); err != nil {
+	if err := hub.HandleICECandidate(peer, p.Candidate, p.SDPMid, p.SDPMLineIndex, p.Seq, p.Epoch); err != nil {
 		log.Printf("peer %s: handle candidate error: %v", peer.ID, err)
 	}
 }

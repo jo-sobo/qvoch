@@ -53,6 +53,8 @@ export function UserList() {
   const [inviteNameInput, setInviteNameInput] = useState(false);
   const [channelName, setChannelName] = useState('');
   const menuRef = useRef<HTMLDivElement>(null);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const touchStartPos = useRef<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     const handler = () => {
@@ -69,9 +71,46 @@ export function UserList() {
   const handleContextMenu = (e: React.MouseEvent, userId: string) => {
     e.preventDefault();
     if (userId === myUserId) return;
-    setContextMenu({ x: e.clientX, y: e.clientY, userId });
+    openContextMenu(e.clientX, e.clientY, userId);
     setInviteNameInput(false);
     setChannelName('');
+  };
+
+  const openContextMenu = (x: number, y: number, userId: string) => {
+    const menuWidth = 200;
+    const menuHeight = 150;
+    const clampedX = Math.min(Math.max(8, x), window.innerWidth - menuWidth - 8);
+    const clampedY = Math.min(Math.max(8, y), window.innerHeight - menuHeight - 8);
+    setContextMenu({ x: clampedX, y: clampedY, userId });
+  };
+
+  const handleTouchStart = (e: React.TouchEvent, userId: string) => {
+    if (userId === myUserId) return;
+    const touch = e.touches[0];
+    touchStartPos.current = { x: touch.clientX, y: touch.clientY };
+    longPressTimer.current = setTimeout(() => {
+      openContextMenu(touch.clientX, touch.clientY, userId);
+      longPressTimer.current = null;
+    }, 500);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!longPressTimer.current || !touchStartPos.current) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - touchStartPos.current.x;
+    const dy = touch.clientY - touchStartPos.current.y;
+    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+    touchStartPos.current = null;
   };
 
   const handleInviteToSub = () => {
@@ -127,6 +166,10 @@ export function UserList() {
             <div
               key={user.id}
               onContextMenu={(e) => handleContextMenu(e, user.id)}
+              onTouchStart={(e) => handleTouchStart(e, user.id)}
+              onTouchMove={handleTouchMove}
+              onTouchEnd={handleTouchEnd}
+              onTouchCancel={handleTouchEnd}
               className={`flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-bg-tertiary/30 cursor-default ${
                 user.id === myUserId ? 'bg-bg-tertiary/20' : ''
               }`}
@@ -178,6 +221,10 @@ export function UserList() {
                 <div
                   key={user.id}
                   onContextMenu={(e) => handleContextMenu(e, user.id)}
+                  onTouchStart={(e) => handleTouchStart(e, user.id)}
+                  onTouchMove={handleTouchMove}
+                  onTouchEnd={handleTouchEnd}
+                  onTouchCancel={handleTouchEnd}
                   className={`flex items-center gap-2 px-4 py-1.5 rounded-md ${
                     user.id === myUserId ? 'bg-bg-tertiary/20' : ''
                   }`}
@@ -203,7 +250,7 @@ export function UserList() {
       {contextMenu && (
         <div
           ref={menuRef}
-          className="fixed bg-bg-secondary border border-border rounded-md shadow-lg z-50 py-1 min-w-45"
+          className="fixed bg-bg-secondary border border-border rounded-md shadow-lg z-40 py-1 min-w-45"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >

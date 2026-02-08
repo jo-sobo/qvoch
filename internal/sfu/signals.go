@@ -22,13 +22,17 @@ type JoinPayload struct {
 }
 
 type AnswerPayload struct {
-	SDP string `json:"sdp"`
+	SDP   string `json:"sdp"`
+	Seq   uint64 `json:"seq"`
+	Epoch uint64 `json:"epoch"`
 }
 
 type CandidatePayload struct {
 	Candidate     string `json:"candidate"`
 	SDPMid        string `json:"sdpMid"`
 	SDPMLineIndex *int   `json:"sdpMLineIndex"`
+	Seq           uint64 `json:"seq"`
+	Epoch         uint64 `json:"epoch"`
 }
 
 type ChatPayload struct {
@@ -82,10 +86,11 @@ type RoomStatePayload struct {
 }
 
 type WelcomePayload struct {
-	UserID       string           `json:"userId"`
-	SessionToken string           `json:"sessionToken"`
-	InviteToken  string           `json:"inviteToken"`
-	RoomState    RoomStatePayload `json:"roomState"`
+	UserID          string           `json:"userId"`
+	SessionToken    string           `json:"sessionToken"`
+	InviteToken     string           `json:"inviteToken"`
+	RoomState       RoomStatePayload `json:"roomState"`
+	ReconnectNotice string           `json:"reconnectNotice,omitempty"`
 }
 
 type ErrorPayload struct {
@@ -101,6 +106,8 @@ type RoomUpdatePayload struct {
 type OfferPayload struct {
 	SDP   string `json:"sdp"`
 	Reset bool   `json:"reset,omitempty"`
+	Seq   uint64 `json:"seq"`
+	Epoch uint64 `json:"epoch"`
 }
 
 type ChatMessageOut struct {

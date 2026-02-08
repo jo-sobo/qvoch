@@ -16,6 +16,13 @@
   --color-speaking: #22c55e;
 }
 
+:root {
+  --z-dropdown: 40;
+  --z-modal: 50;
+  --z-overlay: 60;
+  --z-critical: 100;
+}
+
 /* Light theme overrides */
 [data-theme="light"] {
   --color-bg-primary: #f4f4f8;

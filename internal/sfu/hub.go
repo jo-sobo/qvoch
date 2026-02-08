@@ -24,6 +24,11 @@ type PendingInvite struct {
 	CreatedAt   time.Time
 }
 
+type rebuildEntry struct {
+	peer *Peer
+	room *Room
+}
+
 type Hub struct {
 	Rooms          map[string]*Room
 	RoomsByName    map[string]*Room
@@ -161,52 +166,103 @@ func (h *Hub) CreateRoom(channelName, password string, creator *Peer, ip string)
 	return room, nil
 }
 
-func (h *Hub) JoinRoom(payload JoinPayload, peer *Peer) (*Room, string, error) {
+func (h *Hub) JoinRoom(payload JoinPayload, peer *Peer) (*Room, string, string, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	if payload.SessionToken != "" {
 		existingPeer, ok := h.SessionMap[payload.SessionToken]
 		if ok {
 			existingPeer.mu.RLock()
 			sessionAge := time.Since(existingPeer.SessionCreatedAt)
+			roomID := existingPeer.RoomID
+			mainRoomID := existingPeer.MainRoomID
 			existingPeer.mu.RUnlock()
+
 			if sessionAge > 24*time.Hour {
 				delete(h.SessionMap, payload.SessionToken)
 				ok = false
-			}
-		}
-		if ok {
-			roomID := existingPeer.RoomID
-			mainRoomID := existingPeer.MainRoomID
-			room, roomOk := h.Rooms[roomID]
-			if !roomOk {
-				room = h.Rooms[mainRoomID]
-			}
-			if room != nil {
-				// Replace the connection on the existing peer
-				existingPeer.Lock()
-				existingPeer.Conn = peer.Conn
-				existingPeer.Unlock()
+			} else {
+				mainRoom := h.Rooms[mainRoomID]
+				if mainRoom != nil {
+					oldRoom := mainRoom
+					targetRoom := mainRoom
+					reconnectNotice := ""
 
-				peer.Lock()
-				peer.ID = existingPeer.ID
-				peer.Name = existingPeer.Name
-				peer.SessionToken = existingPeer.SessionToken
-				peer.RoomID = existingPeer.RoomID
-				peer.MainRoomID = existingPeer.MainRoomID
-				peer.Muted = existingPeer.Muted
-				peer.PC = existingPeer.PC
-				peer.Track = existingPeer.Track
-				peer.Unlock()
+					if roomID != "" && roomID != mainRoomID {
+						mainRoom.mu.RLock()
+						sub, exists := mainRoom.SubChannels[roomID]
+						mainRoom.mu.RUnlock()
+						if exists {
+							oldRoom = sub
+							targetRoom = sub
+						} else {
+							reconnectNotice = "Your previous sub-channel no longer exists. You were moved to the main channel."
+						}
+					}
 
-				existingPeer.Lock()
-				existingPeer.PC = nil
-				existingPeer.Track = nil
-				existingPeer.Unlock()
+					h.mu.Unlock()
+					if oldRoom != nil {
+						h.RemoveTrackFromPeers(existingPeer, oldRoom)
+					}
+					h.ClosePeerConnection(existingPeer)
+					h.mu.Lock()
 
-				log.Printf("peer %s reconnected via session token", existingPeer.ID)
-				return room, payload.SessionToken, nil
+					currentPeer, stillExists := h.SessionMap[payload.SessionToken]
+					if !stillExists || currentPeer != existingPeer {
+						h.mu.Unlock()
+						return nil, "", "", fmt.Errorf("%s:Session reconnect conflicted, retry", ErrInvalidMessage)
+					}
+
+					mainRoom = h.Rooms[mainRoomID]
+					if mainRoom == nil {
+						delete(h.SessionMap, payload.SessionToken)
+					} else {
+						targetRoom = mainRoom
+						if roomID != "" && roomID != mainRoomID {
+							mainRoom.mu.RLock()
+							sub, exists := mainRoom.SubChannels[roomID]
+							mainRoom.mu.RUnlock()
+							if exists {
+								targetRoom = sub
+								reconnectNotice = ""
+							}
+						}
+
+						peer.mu.Lock()
+						peer.ID = existingPeer.ID
+						peer.Name = existingPeer.Name
+						peer.RoomID = targetRoom.ID
+						peer.MainRoomID = mainRoomID
+						peer.Muted = existingPeer.Muted
+						peer.mu.Unlock()
+
+						targetRoom.mu.Lock()
+						targetRoom.Peers[peer.ID] = peer
+						targetRoom.Expiry = time.Time{}
+						targetRoom.mu.Unlock()
+
+						newSessionToken := uuid.New().String()
+						delete(h.SessionMap, payload.SessionToken)
+						peer.mu.Lock()
+						peer.SessionToken = newSessionToken
+						peer.SessionCreatedAt = time.Now()
+						peer.mu.Unlock()
+						h.SessionMap[newSessionToken] = peer
+
+						// Neutralize the old peer object so its deferred disconnect
+						// handler cannot remove the reconnected peer by ID.
+						existingPeer.mu.Lock()
+						existingPeer.RoomID = ""
+						existingPeer.MainRoomID = ""
+						existingPeer.SessionToken = ""
+						existingPeer.Conn = nil
+						existingPeer.mu.Unlock()
+
+						log.Printf("peer %s reconnected via session token", peer.ID)
+						h.mu.Unlock()
+						return targetRoom, newSessionToken, reconnectNotice, nil
+					}
+				}
 			}
 		}
 	}
@@ -216,36 +272,43 @@ func (h *Hub) JoinRoom(payload JoinPayload, peer *Peer) (*Room, string, error) {
 	if payload.InviteToken != "" {
 		r, ok := h.InviteMap[payload.InviteToken]
 		if !ok {
-			return nil, "", fmt.Errorf("%s:Room not found", ErrChannelNotFound)
+			h.mu.Unlock()
+			return nil, "", "", fmt.Errorf("%s:Room not found", ErrChannelNotFound)
 		}
 		if time.Since(r.CreatedAt) > 7*24*time.Hour {
 			delete(h.InviteMap, payload.InviteToken)
-			return nil, "", fmt.Errorf("%s:Invite link has expired", ErrInviteExpired)
+			h.mu.Unlock()
+			return nil, "", "", fmt.Errorf("%s:Invite link has expired", ErrInviteExpired)
 		}
 		room = r
 	} else if payload.ChannelName != "" {
 		r, ok := h.RoomsByName[payload.ChannelName]
 		if !ok {
-			return nil, "", fmt.Errorf("%s:Room not found", ErrChannelNotFound)
+			h.mu.Unlock()
+			return nil, "", "", fmt.Errorf("%s:Room not found", ErrChannelNotFound)
 		}
 		room = r
 
 		if payload.Password == "" {
-			return nil, "", fmt.Errorf("%s:Password is required", ErrPasswordRequired)
+			h.mu.Unlock()
+			return nil, "", "", fmt.Errorf("%s:Password is required", ErrPasswordRequired)
 		}
 		if err := bcrypt.CompareHashAndPassword([]byte(room.PasswordHash), []byte(payload.Password)); err != nil {
-			return nil, "", fmt.Errorf("%s:Invalid password", ErrPasswordWrong)
+			h.mu.Unlock()
+			return nil, "", "", fmt.Errorf("%s:Invalid password", ErrPasswordWrong)
 		}
 	} else {
-		return nil, "", fmt.Errorf("%s:Must provide channelName or inviteToken", ErrInvalidMessage)
+		h.mu.Unlock()
+		return nil, "", "", fmt.Errorf("%s:Must provide channelName or inviteToken", ErrInvalidMessage)
 	}
 
 	room.mu.Lock()
-	defer room.mu.Unlock()
+	h.mu.Unlock()
 
 	targetRoom := room
 	if room.ParentID != "" {
-		return nil, "", fmt.Errorf("%s:Cannot join sub-channel directly", ErrInvalidMessage)
+		room.mu.Unlock()
+		return nil, "", "", fmt.Errorf("%s:Cannot join sub-channel directly", ErrInvalidMessage)
 	}
 
 	totalPeers := len(targetRoom.Peers)
@@ -255,11 +318,13 @@ func (h *Hub) JoinRoom(payload JoinPayload, peer *Peer) (*Room, string, error) {
 		sub.mu.RUnlock()
 	}
 	if totalPeers >= h.maxUsersPerRoom {
-		return nil, "", fmt.Errorf("%s:Room is full", ErrChannelFull)
+		room.mu.Unlock()
+		return nil, "", "", fmt.Errorf("%s:Room is full", ErrChannelFull)
 	}
 
 	if h.isNameTakenInRoom(targetRoom, payload.Username) {
-		return nil, "", fmt.Errorf("%s:Username already taken in this room", ErrNameTaken)
+		room.mu.Unlock()
+		return nil, "", "", fmt.Errorf("%s:Username already taken in this room", ErrNameTaken)
 	}
 
 	peer.mu.Lock()
@@ -269,16 +334,20 @@ func (h *Hub) JoinRoom(payload JoinPayload, peer *Peer) (*Room, string, error) {
 	peer.mu.Unlock()
 
 	targetRoom.AddPeer(peer)
+	room.mu.Unlock()
 
 	sessionToken := uuid.New().String()
 	peer.mu.Lock()
 	peer.SessionToken = sessionToken
 	peer.SessionCreatedAt = time.Now()
 	peer.mu.Unlock()
+
+	h.mu.Lock()
 	h.SessionMap[sessionToken] = peer
+	h.mu.Unlock()
 
 	log.Printf("peer %s (%s) joined room %s", peer.Name, peer.ID, targetRoom.FullName)
-	return targetRoom, sessionToken, nil
+	return targetRoom, sessionToken, "", nil
 }
 
 func (h *Hub) isNameTakenInRoom(room *Room, username string) bool {
@@ -306,7 +375,7 @@ func (h *Hub) isNameTakenInRoom(room *Room, username string) bool {
 	return false
 }
 
-func (h *Hub) RemovePeer(peer *Peer) {
+func (h *Hub) RemovePeer(peer *Peer, preserveSession bool) {
 	peer.mu.RLock()
 	roomID := peer.RoomID
 	mainRoomID := peer.MainRoomID
@@ -319,7 +388,9 @@ func (h *Hub) RemovePeer(peer *Peer) {
 
 	var currentRoom *Room
 	h.mu.Lock()
-	delete(h.SessionMap, sessionToken)
+	if !preserveSession && sessionToken != "" {
+		delete(h.SessionMap, sessionToken)
+	}
 
 	room, ok := h.Rooms[roomID]
 	if !ok {
@@ -362,10 +433,13 @@ func (h *Hub) RemovePeer(peer *Peer) {
 			h.broadcastRoomUpdate(mainRoom)
 		}
 
-		peer.mu.Lock()
-		peer.RoomID = ""
-		peer.MainRoomID = ""
-		peer.mu.Unlock()
+		if !preserveSession {
+			peer.mu.Lock()
+			peer.RoomID = ""
+			peer.MainRoomID = ""
+			peer.SessionToken = ""
+			peer.mu.Unlock()
+		}
 
 		log.Printf("peer %s removed from sub-channel %s", peer.ID, roomID)
 		return
@@ -391,10 +465,13 @@ func (h *Hub) RemovePeer(peer *Peer) {
 		}
 	}
 
-	peer.mu.Lock()
-	peer.RoomID = ""
-	peer.MainRoomID = ""
-	peer.mu.Unlock()
+	if !preserveSession {
+		peer.mu.Lock()
+		peer.RoomID = ""
+		peer.MainRoomID = ""
+		peer.SessionToken = ""
+		peer.mu.Unlock()
+	}
 
 	log.Printf("peer %s removed from room %s", peer.ID, roomID)
 }
@@ -588,14 +665,14 @@ func (h *Hub) HandleSubResponse(peer *Peer, inviteID string, accepted bool) {
 	mainRoom := invite.MainRoom
 
 	subRoom := &Room{
-		ID:          subID,
-		Name:        invite.ChannelName,
-		FullName:    mainRoom.FullName,
-		ParentID:    mainRoom.ID,
+		ID:           subID,
+		Name:         invite.ChannelName,
+		FullName:     mainRoom.FullName,
+		ParentID:     mainRoom.ID,
 		PasswordHash: mainRoom.PasswordHash,
-		Peers:       make(map[string]*Peer),
-		SubChannels: make(map[string]*Room),
-		ChatHistory: make([]ChatMessage, 0),
+		Peers:        make(map[string]*Peer),
+		SubChannels:  make(map[string]*Room),
+		ChatHistory:  make([]ChatMessage, 0),
 	}
 
 	// Save tracks before closing PCs — we need them to remove from remaining peers.
@@ -642,9 +719,17 @@ func (h *Hub) HandleSubResponse(peer *Peer, inviteID string, accepted bool) {
 			continue
 		}
 		h.AddTrackToPeers(p, subRoom)
-		if err := h.SendOffer(p); err != nil {
-			log.Printf("failed to send offer to %s in sub-channel: %v", p.ID, err)
-		}
+		go func(target *Peer, targetRoom *Room) {
+			if err := h.NegotiateOffer(target, true); err != nil {
+				log.Printf("failed to send initial offer to %s in sub-channel: %v", target.ID, err)
+				return
+			}
+			if h.AddRoomTracksToPeer(target, targetRoom) {
+				if err := h.NegotiateOffer(target, false); err != nil {
+					log.Printf("failed to send room-track offer to %s in sub-channel: %v", target.ID, err)
+				}
+			}
+		}(p, subRoom)
 	}
 
 	h.broadcastRoomUpdate(mainRoom)
@@ -708,9 +793,17 @@ func (h *Hub) HandleMoveToMain(peer *Peer) {
 		log.Printf("failed to create PC for %s moving to main: %v", peer.ID, err)
 	} else {
 		h.AddTrackToPeers(peer, mainRoom)
-		if err := h.SendOffer(peer); err != nil {
-			log.Printf("failed to send offer to %s: %v", peer.ID, err)
-		}
+		go func(target *Peer, targetRoom *Room) {
+			if err := h.NegotiateOffer(target, true); err != nil {
+				log.Printf("failed to send initial offer to %s: %v", target.ID, err)
+				return
+			}
+			if h.AddRoomTracksToPeer(target, targetRoom) {
+				if err := h.NegotiateOffer(target, false); err != nil {
+					log.Printf("failed to send room-track offer to %s: %v", target.ID, err)
+				}
+			}
+		}(peer, mainRoom)
 	}
 
 	h.sendChatHistory(peer, mainRoom)
@@ -801,9 +894,17 @@ func (h *Hub) HandleMoveToSub(peer *Peer, targetSubID string) {
 		log.Printf("failed to create PC for %s moving to sub: %v", peer.ID, err)
 	} else {
 		h.AddTrackToPeers(peer, targetSub)
-		if err := h.SendOffer(peer); err != nil {
-			log.Printf("failed to send offer to %s: %v", peer.ID, err)
-		}
+		go func(target *Peer, targetRoom *Room) {
+			if err := h.NegotiateOffer(target, true); err != nil {
+				log.Printf("failed to send initial offer to %s: %v", target.ID, err)
+				return
+			}
+			if h.AddRoomTracksToPeer(target, targetRoom) {
+				if err := h.NegotiateOffer(target, false); err != nil {
+					log.Printf("failed to send room-track offer to %s: %v", target.ID, err)
+				}
+			}
+		}(peer, targetSub)
 	}
 
 	h.sendChatHistory(peer, targetSub)
@@ -919,10 +1020,27 @@ func (h *Hub) sendChatHistory(peer *Peer, room *Room) {
 	})
 }
 
-func (h *Hub) BuildWelcomePayload(peer *Peer, room *Room, sessionToken string) WelcomePayload {
+func (h *Hub) BuildWelcomePayload(peer *Peer, room *Room, sessionToken string, reconnectNotice string) WelcomePayload {
+	mainRoom := room
+	if room.ParentID != "" {
+		h.mu.RLock()
+		parent := h.Rooms[room.ParentID]
+		h.mu.RUnlock()
+		if parent != nil {
+			mainRoom = parent
+		}
+	}
+
+	mainRoom.mu.RLock()
+	users := mainRoom.GetUserInfos()
+	subChannels := mainRoom.GetSubChannelInfos()
+	mainRoomID := mainRoom.ID
+	mainRoomName := mainRoom.Name
+	mainRoomFullName := mainRoom.FullName
+	inviteToken := mainRoom.InviteToken
+	mainRoom.mu.RUnlock()
+
 	room.mu.RLock()
-	users := room.GetUserInfos()
-	subChannels := room.GetSubChannelInfos()
 	chatHistory := room.GetChatHistoryOut()
 	room.mu.RUnlock()
 
@@ -931,13 +1049,14 @@ func (h *Hub) BuildWelcomePayload(peer *Peer, room *Room, sessionToken string) W
 	peer.mu.RUnlock()
 
 	return WelcomePayload{
-		UserID:       peer.ID,
-		SessionToken: sessionToken,
-		InviteToken:  room.InviteToken,
+		UserID:          peer.ID,
+		SessionToken:    sessionToken,
+		InviteToken:     inviteToken,
+		ReconnectNotice: reconnectNotice,
 		RoomState: RoomStatePayload{
-			ID:               room.ID,
-			Name:             room.Name,
-			FullName:         room.FullName,
+			ID:               mainRoomID,
+			Name:             mainRoomName,
+			FullName:         mainRoomFullName,
 			CurrentChannelID: currentChannelID,
 			Users:            users,
 			SubChannels:      subChannels,
@@ -957,9 +1076,10 @@ func (h *Hub) startGC() {
 
 func (h *Hub) gc() {
 	now := time.Now()
+	peersToRebuild := make([]rebuildEntry, 0)
+	roomsToBroadcast := make(map[*Room]struct{})
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
 
 	for token, peer := range h.SessionMap {
 		peer.mu.RLock()
@@ -1009,11 +1129,17 @@ func (h *Hub) gc() {
 			}
 
 			if len(sub.Peers) == 1 && !sub.Expiry.IsZero() && now.Sub(sub.Expiry) > 5*time.Minute {
+				var lastPeer *Peer
 				for _, p := range sub.Peers {
-					p.mu.Lock()
-					p.RoomID = room.ID
-					p.mu.Unlock()
-					room.AddPeer(p)
+					lastPeer = p
+				}
+				if lastPeer != nil {
+					lastPeer.mu.Lock()
+					lastPeer.RoomID = room.ID
+					lastPeer.mu.Unlock()
+					room.AddPeer(lastPeer)
+					peersToRebuild = append(peersToRebuild, rebuildEntry{peer: lastPeer, room: room})
+					roomsToBroadcast[room] = struct{}{}
 				}
 				sub.Peers = make(map[string]*Peer)
 				delete(room.SubChannels, subID)
@@ -1038,5 +1164,31 @@ func (h *Hub) gc() {
 		}
 
 		room.mu.Unlock()
+	}
+
+	h.mu.Unlock()
+
+	for _, entry := range peersToRebuild {
+		h.ClosePeerConnection(entry.peer)
+		if err := h.CreatePeerConnection(entry.peer, entry.room); err != nil {
+			log.Printf("GC: failed to rebuild PC for %s: %v", entry.peer.ID, err)
+			continue
+		}
+		h.AddTrackToPeers(entry.peer, entry.room)
+		go func(target *Peer, targetRoom *Room) {
+			if err := h.NegotiateOffer(target, true); err != nil {
+				log.Printf("GC: failed to send rebuilt initial offer to %s: %v", target.ID, err)
+				return
+			}
+			if h.AddRoomTracksToPeer(target, targetRoom) {
+				if err := h.NegotiateOffer(target, false); err != nil {
+					log.Printf("GC: failed to send rebuilt room-track offer to %s: %v", target.ID, err)
+				}
+			}
+		}(entry.peer, entry.room)
+	}
+
+	for room := range roomsToBroadcast {
+		h.broadcastRoomUpdate(room)
 	}
 }

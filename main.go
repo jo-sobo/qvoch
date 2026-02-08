@@ -14,6 +14,8 @@ import (
 	_ "github.com/jonas/qvoch/internal/sfu"
 )
 
+const serverBuildID = "2026-02-08-webrtc-debug-6"
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -29,7 +31,7 @@ func main() {
 	handler = sitePassphraseMiddleware(handler)
 
 	addr := fmt.Sprintf(":%s", port)
-	log.Printf("QVoCh server starting on %s", addr)
+	log.Printf("QVoCh server starting on %s (build=%s)", addr, serverBuildID)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
@@ -62,7 +64,9 @@ func sitePassphraseMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Invite links bypass site passphrase: set auth cookie and redirect to SPA
+		// SECURITY NOTE: invite links intentionally bypass SITE_PASSPHRASE.
+		// The invite token itself acts as authorization. If you require
+		// passphrase checks for every access path, remove this bypass block.
 		if strings.HasPrefix(r.URL.Path, "/invite/") {
 			rest := strings.TrimPrefix(r.URL.Path, "/invite/")
 			if rest != "" {

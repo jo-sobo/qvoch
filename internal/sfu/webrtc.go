@@ -6,7 +6,10 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 )
 
@@ -35,13 +38,25 @@ func resolvePublicIP(raw string) string {
 		log.Printf("PUBLIC_IP: using %s", raw)
 		return raw
 	}
-	addrs, err := net.LookupHost(raw)
-	if err != nil || len(addrs) == 0 {
+	ips, err := net.LookupIP(raw)
+	if err != nil || len(ips) == 0 {
 		log.Printf("WARNING: PUBLIC_IP=%q is not a valid IP and could not be resolved — NAT1To1 disabled", raw)
 		return ""
 	}
-	log.Printf("PUBLIC_IP: resolved %s → %s", raw, addrs[0])
-	return addrs[0]
+
+	// Prefer IPv4 so candidate advertisement matches common home-router UDP
+	// forwarding setups when a hostname resolves to both A and AAAA records.
+	for _, ip := range ips {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			resolved := ipv4.String()
+			log.Printf("PUBLIC_IP: resolved %s → %s (preferred IPv4)", raw, resolved)
+			return resolved
+		}
+	}
+
+	resolved := ips[0].String()
+	log.Printf("PUBLIC_IP: resolved %s → %s", raw, resolved)
+	return resolved
 }
 
 func getEnvUint16(key string, defaultVal uint16) uint16 {
@@ -81,6 +96,7 @@ func NewWebRTCAPI() (*webrtc.API, WebRTCConfig) {
 
 func (h *Hub) CreatePeerConnection(peer *Peer, room *Room) error {
 	api := h.getWebRTCAPI()
+	_ = room
 
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -103,47 +119,67 @@ func (h *Hub) CreatePeerConnection(peer *Peer, room *Room) error {
 		return fmt.Errorf("create track: %w", err)
 	}
 
+	peer.negoMu.Lock()
 	peer.Lock()
+	if peer.signalingReady != nil {
+		close(peer.signalingReady)
+		peer.signalingReady = nil
+	}
 	peer.PC = pc
 	peer.Track = track
+	peer.Epoch++
+	peer.OfferSeq = 0
+	peer.pendingRenego = false
+	peer.iceRestartQueued = false
 	peer.Unlock()
-
-	room.mu.RLock()
-	for _, existingPeer := range room.Peers {
-		if existingPeer.ID == peer.ID {
-			continue
-		}
-		existingPeer.RLock()
-		existingTrack := existingPeer.Track
-		existingPeer.RUnlock()
-
-		if existingTrack != nil {
-			if _, err := pc.AddTransceiverFromTrack(existingTrack, webrtc.RTPTransceiverInit{
-				Direction: webrtc.RTPTransceiverDirectionSendonly,
-			}); err != nil {
-				log.Printf("failed to add track from %s to %s: %v", existingPeer.ID, peer.ID, err)
-			}
-		}
-	}
-	room.mu.RUnlock()
+	peer.negoMu.Unlock()
 
 	pc.OnTrack(func(remoteTrack *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		log.Printf("peer %s: OnTrack, codec=%s", peer.ID, remoteTrack.Codec().MimeType)
 
 		go func() {
 			buf := make([]byte, 1500)
+			rtpPkt := &rtp.Packet{}
+			lastStatsLog := time.Now()
+			var rxPackets uint64
+			var forwardedPackets uint64
+			var forwardErrors uint64
 			for {
 				n, _, err := remoteTrack.Read(buf)
 				if err != nil {
 					return
 				}
+				rxPackets++
+
+				if err := rtpPkt.Unmarshal(buf[:n]); err != nil {
+					log.Printf("peer %s: failed to unmarshal RTP packet: %v", peer.ID, err)
+					continue
+				}
+
+				// Cross-browser peers may negotiate different RTP header extension IDs
+				// (e.g. Firefox vs Chrome). Forwarding extensions untouched can break
+				// decode on receivers, so strip them before re-writing.
+				rtpPkt.Extension = false
+				rtpPkt.Extensions = nil
+
 				peer.RLock()
 				t := peer.Track
 				peer.RUnlock()
 				if t != nil {
-					if _, err := t.Write(buf[:n]); err != nil {
-						return
+					if err := t.WriteRTP(rtpPkt); err != nil {
+						// TrackLocalStaticRTP may return aggregated write errors for one
+						// binding while still delivering to others. Don't stop forwarding.
+						log.Printf("peer %s: forward write error: %v", peer.ID, err)
+						forwardErrors++
+					} else {
+						forwardedPackets++
 					}
+				}
+
+				if time.Since(lastStatsLog) >= 5*time.Second {
+					log.Printf("peer %s: RTP stats rx=%d forwarded=%d forwardErrors=%d",
+						peer.ID, rxPackets, forwardedPackets, forwardErrors)
+					lastStatsLog = time.Now()
 				}
 			}
 		}()
@@ -154,95 +190,273 @@ func (h *Hub) CreatePeerConnection(peer *Peer, room *Room) error {
 			return
 		}
 		candidateJSON := c.ToJSON()
+		peer.RLock()
+		seq := peer.OfferSeq
+		epoch := peer.Epoch
+		peer.RUnlock()
 		peer.SendJSON("candidate", CandidatePayload{
 			Candidate:     candidateJSON.Candidate,
 			SDPMid:        safeString(candidateJSON.SDPMid),
 			SDPMLineIndex: safeIntPtr(candidateJSON.SDPMLineIndex),
+			Seq:           seq,
+			Epoch:         epoch,
 		})
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("peer %s: connection state: %s", peer.ID, state.String())
-		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
-			// Connection lost — handled by WebSocket close
+		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			peer.Lock()
+			peer.iceRestartQueued = false
+			peer.Unlock()
+		case webrtc.PeerConnectionStateDisconnected:
+			h.queueICERestart(peer, 3*time.Second)
+		case webrtc.PeerConnectionStateFailed:
+			h.queueICERestart(peer, 0)
 		}
 	})
 
 	return nil
 }
 
-func (h *Hub) SendOffer(peer *Peer) error {
-	peer.RLock()
-	pc := peer.PC
-	peer.RUnlock()
+func (h *Hub) queueICERestart(peer *Peer, delay time.Duration) {
+	peer.Lock()
+	if peer.iceRestartQueued {
+		peer.Unlock()
+		return
+	}
+	peer.iceRestartQueued = true
+	peer.Unlock()
 
-	if pc == nil {
-		return fmt.Errorf("no peer connection")
+	if delay <= 0 {
+		go h.attemptICERestart(peer)
+		return
 	}
 
-	_, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
-		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	time.AfterFunc(delay, func() {
+		h.attemptICERestart(peer)
 	})
-	if err != nil {
-		return fmt.Errorf("add transceiver: %w", err)
-	}
-
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("create offer: %w", err)
-	}
-
-	if err := pc.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
-	}
-
-	peer.SendJSON("offer", OfferPayload{SDP: offer.SDP, Reset: true})
-	return nil
 }
 
-func (h *Hub) HandleAnswer(peer *Peer, sdp string) error {
+func (h *Hub) attemptICERestart(peer *Peer) {
+	peer.negoMu.Lock()
+
 	peer.RLock()
 	pc := peer.PC
 	peer.RUnlock()
 
 	if pc == nil {
+		peer.Lock()
+		peer.iceRestartQueued = false
+		peer.Unlock()
+		peer.negoMu.Unlock()
+		return
+	}
+
+	state := pc.ConnectionState()
+	if state == webrtc.PeerConnectionStateConnected || state == webrtc.PeerConnectionStateClosed {
+		peer.Lock()
+		peer.iceRestartQueued = false
+		peer.Unlock()
+		peer.negoMu.Unlock()
+		return
+	}
+
+	log.Printf("peer %s: attempting ICE restart, connectionState=%s", peer.ID, state.String())
+
+	offer, err := pc.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+	if err != nil {
+		log.Printf("peer %s: ICE restart offer failed: %v", peer.ID, err)
+		peer.Lock()
+		peer.iceRestartQueued = false
+		peer.Unlock()
+		peer.negoMu.Unlock()
+		return
+	}
+	if err := pc.SetLocalDescription(offer); err != nil {
+		log.Printf("peer %s: ICE restart set local description failed: %v", peer.ID, err)
+		peer.Lock()
+		peer.iceRestartQueued = false
+		peer.Unlock()
+		peer.negoMu.Unlock()
+		return
+	}
+
+	peer.Lock()
+	peer.OfferSeq++
+	seq := peer.OfferSeq
+	epoch := peer.Epoch
+	peer.pendingRenego = false
+	peer.iceRestartQueued = false
+	if peer.signalingReady != nil {
+		close(peer.signalingReady)
+	}
+	sr := make(chan struct{})
+	peer.signalingReady = sr
+	peer.Unlock()
+
+	peer.SendJSON("offer", OfferPayload{
+		SDP:   offer.SDP,
+		Seq:   seq,
+		Epoch: epoch,
+	})
+
+	peer.negoMu.Unlock()
+
+	select {
+	case <-sr:
+		log.Printf("peer %s: ICE restart completed", peer.ID)
+	case <-time.After(10 * time.Second):
+		log.Printf("peer %s: ICE restart answer timeout", peer.ID)
+	}
+}
+
+func (h *Hub) NegotiateOffer(peer *Peer, isInitial bool) error {
+	return h.negotiateOffer(peer, isInitial)
+}
+
+func (h *Hub) negotiateOffer(peer *Peer, isInitial bool) error {
+	for {
+		peer.negoMu.Lock()
+
+		peer.RLock()
+		pc := peer.PC
+		epoch := peer.Epoch
+		peer.RUnlock()
+
+		if pc == nil {
+			peer.negoMu.Unlock()
+			return fmt.Errorf("no peer connection")
+		}
+
+		if isInitial {
+			if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+				Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			}); err != nil {
+				peer.negoMu.Unlock()
+				return fmt.Errorf("add transceiver: %w", err)
+			}
+			isInitial = false
+		}
+
+		if pc.SignalingState() != webrtc.SignalingStateStable {
+			log.Printf("peer %s: deferring renegotiation, signaling state is %s", peer.ID, pc.SignalingState().String())
+			peer.Lock()
+			peer.pendingRenego = true
+			peer.Unlock()
+			peer.negoMu.Unlock()
+			return nil
+		}
+
+		peer.Lock()
+		peer.OfferSeq++
+		seq := peer.OfferSeq
+		peer.pendingRenego = false
+		if peer.signalingReady != nil {
+			close(peer.signalingReady)
+		}
+		sr := make(chan struct{})
+		peer.signalingReady = sr
+		peer.Unlock()
+
+		offer, err := pc.CreateOffer(nil)
+		if err != nil {
+			peer.negoMu.Unlock()
+			return fmt.Errorf("create offer: %w", err)
+		}
+		if err := pc.SetLocalDescription(offer); err != nil {
+			peer.negoMu.Unlock()
+			return fmt.Errorf("set local description: %w", err)
+		}
+
+		log.Printf("peer %s: offer seq=%d epoch=%d initial=%t signalingState=%s transceivers=%s",
+			peer.ID, seq, epoch, seq == 1, pc.SignalingState().String(), summarizeTransceivers(pc))
+		peer.SendJSON("offer", OfferPayload{
+			SDP:   offer.SDP,
+			Reset: seq == 1,
+			Seq:   seq,
+			Epoch: epoch,
+		})
+
+		peer.negoMu.Unlock()
+
+		select {
+		case <-sr:
+		case <-time.After(10 * time.Second):
+			log.Printf("peer %s: answer timeout seq=%d epoch=%d", peer.ID, seq, epoch)
+			return nil
+		}
+
+		peer.Lock()
+		needsRenego := peer.pendingRenego
+		peer.pendingRenego = false
+		peer.Unlock()
+
+		if !needsRenego {
+			return nil
+		}
+		log.Printf("peer %s: processing deferred renegotiation", peer.ID)
+	}
+}
+
+func (h *Hub) HandleAnswer(peer *Peer, sdp string, seq uint64, epoch uint64) error {
+	peer.RLock()
+	pc := peer.PC
+	currentEpoch := peer.Epoch
+	currentSeq := peer.OfferSeq
+	peer.RUnlock()
+
+	if pc == nil {
 		return fmt.Errorf("no peer connection")
 	}
-
-	answer := webrtc.SessionDescription{
-		Type: webrtc.SDPTypeAnswer,
-		SDP:  sdp,
+	if epoch != currentEpoch {
+		log.Printf("peer %s: discarding stale answer epoch=%d (current=%d)", peer.ID, epoch, currentEpoch)
+		return nil
+	}
+	if seq != currentSeq {
+		log.Printf("peer %s: discarding stale answer seq=%d (current=%d)", peer.ID, seq, currentSeq)
+		return nil
 	}
 
+	answer := webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdp}
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		return fmt.Errorf("set remote description: %w", err)
 	}
 
-	// Check if a renegotiation was deferred while we were waiting for this answer.
-	peer.Lock()
-	needsRenego := peer.NeedsRenegotiation
-	peer.NeedsRenegotiation = false
-	peer.Unlock()
+	log.Printf("peer %s: answer received seq=%d epoch=%d transceivers=%s",
+		peer.ID, seq, epoch, summarizeTransceivers(pc))
 
-	if needsRenego {
-		log.Printf("peer %s: triggering deferred renegotiation", peer.ID)
-		go func() {
-			if err := h.renegotiate(peer); err != nil {
-				log.Printf("peer %s: deferred renegotiation failed: %v", peer.ID, err)
-			}
-		}()
+	peer.Lock()
+	if peer.signalingReady != nil {
+		close(peer.signalingReady)
+		peer.signalingReady = nil
 	}
+	peer.Unlock()
 
 	return nil
 }
 
-func (h *Hub) HandleICECandidate(peer *Peer, candidate string, sdpMid string, sdpMLineIndex *int) error {
+func (h *Hub) HandleICECandidate(peer *Peer, candidate string, sdpMid string, sdpMLineIndex *int, seq uint64, epoch uint64) error {
 	peer.RLock()
 	pc := peer.PC
+	currentEpoch := peer.Epoch
+	currentSeq := peer.OfferSeq
 	peer.RUnlock()
 
 	if pc == nil {
 		return fmt.Errorf("no peer connection")
+	}
+	if epoch != currentEpoch {
+		log.Printf("peer %s: discarding stale ICE candidate epoch=%d (current=%d)", peer.ID, epoch, currentEpoch)
+		return nil
+	}
+	if seq > currentSeq {
+		log.Printf("peer %s: discarding future ICE candidate seq=%d (current=%d)", peer.ID, seq, currentSeq)
+		return nil
+	}
+	if seq < currentSeq {
+		log.Printf("peer %s: accepting late ICE candidate seq=%d (current=%d)", peer.ID, seq, currentSeq)
 	}
 
 	var sdpMLineIndexUint16 *uint16
@@ -287,6 +501,7 @@ func (h *Hub) AddTrackToPeers(newPeer *Peer, room *Room) {
 	}
 	room.mu.RUnlock()
 
+	needsRenego := make([]*Peer, 0, len(peers))
 	for _, p := range peers {
 		p.RLock()
 		pc := p.PC
@@ -295,18 +510,88 @@ func (h *Hub) AddTrackToPeers(newPeer *Peer, room *Room) {
 		if pc == nil {
 			continue
 		}
-
-		if _, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
-			Direction: webrtc.RTPTransceiverDirectionSendonly,
-		}); err != nil {
-			log.Printf("failed to add track from %s to %s: %v", newPeer.ID, p.ID, err)
+		if hasSenderForTrack(pc, track) {
 			continue
 		}
 
-		if err := h.renegotiate(p); err != nil {
-			log.Printf("failed to renegotiate with %s: %v", p.ID, err)
+		transceiver, err := pc.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			log.Printf("failed to add track from %s to %s: %v", newPeer.ID, p.ID, err)
+			continue
+		}
+		if transceiver != nil && transceiver.Sender() != nil {
+			h.drainSenderRTCP(transceiver.Sender())
+		}
+		log.Printf("peer %s: attached outbound track from %s", p.ID, newPeer.ID)
+
+		needsRenego = append(needsRenego, p)
+	}
+
+	for _, p := range needsRenego {
+		go func(target *Peer) {
+			if err := h.NegotiateOffer(target, false); err != nil {
+				log.Printf("failed to renegotiate with %s: %v", target.ID, err)
+			}
+		}(p)
+	}
+}
+
+// AddRoomTracksToPeer ensures the target peer has senders for all other peers'
+// tracks in the room. It only mutates transceivers and does not renegotiate.
+func (h *Hub) AddRoomTracksToPeer(targetPeer *Peer, room *Room) bool {
+	targetPeer.RLock()
+	targetPC := targetPeer.PC
+	targetPeerID := targetPeer.ID
+	targetPeer.RUnlock()
+
+	if targetPC == nil {
+		return false
+	}
+
+	room.mu.RLock()
+	peers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		if p.ID != targetPeerID {
+			peers = append(peers, p)
 		}
 	}
+	room.mu.RUnlock()
+
+	addedAny := false
+	addedCount := 0
+	for _, p := range peers {
+		p.RLock()
+		track := p.Track
+		p.RUnlock()
+		if track == nil {
+			continue
+		}
+		if hasSenderForTrack(targetPC, track) {
+			continue
+		}
+
+		transceiver, err := targetPC.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+			Direction: webrtc.RTPTransceiverDirectionSendonly,
+		})
+		if err != nil {
+			log.Printf("failed to add room track from %s to %s: %v", p.ID, targetPeerID, err)
+			continue
+		}
+		if transceiver != nil && transceiver.Sender() != nil {
+			h.drainSenderRTCP(transceiver.Sender())
+		}
+		addedAny = true
+		addedCount++
+		log.Printf("peer %s: attached existing track from %s", targetPeerID, p.ID)
+	}
+
+	if addedAny {
+		log.Printf("peer %s: added %d existing room tracks", targetPeerID, addedCount)
+	}
+
+	return addedAny
 }
 
 func (h *Hub) RemoveTrackFromPeers(leavingPeer *Peer, room *Room) {
@@ -327,6 +612,7 @@ func (h *Hub) RemoveTrackFromPeers(leavingPeer *Peer, room *Room) {
 	}
 	room.mu.RUnlock()
 
+	needsRenego := make([]*Peer, 0, len(peers))
 	for _, p := range peers {
 		p.RLock()
 		pc := p.PC
@@ -336,67 +622,50 @@ func (h *Hub) RemoveTrackFromPeers(leavingPeer *Peer, room *Room) {
 			continue
 		}
 
+		removed := false
 		for _, sender := range pc.GetSenders() {
 			if sender.Track() == track {
 				if err := pc.RemoveTrack(sender); err != nil {
 					log.Printf("failed to remove track from %s: %v", p.ID, err)
+					continue
 				}
-				break
+				removed = true
 			}
 		}
 
-		if err := h.renegotiate(p); err != nil {
-			log.Printf("failed to renegotiate with %s after track removal: %v", p.ID, err)
+		if removed {
+			needsRenego = append(needsRenego, p)
 		}
+	}
+
+	for _, p := range needsRenego {
+		go func(target *Peer) {
+			if err := h.NegotiateOffer(target, false); err != nil {
+				log.Printf("failed to renegotiate with %s after track removal: %v", target.ID, err)
+			}
+		}(p)
 	}
 }
 
 func (h *Hub) ClosePeerConnection(peer *Peer) {
+	peer.negoMu.Lock()
 	peer.Lock()
 	pc := peer.PC
 	peer.PC = nil
 	peer.Track = nil
+	peer.OfferSeq = 0
+	peer.pendingRenego = false
+	peer.iceRestartQueued = false
+	if peer.signalingReady != nil {
+		close(peer.signalingReady)
+		peer.signalingReady = nil
+	}
 	peer.Unlock()
+	peer.negoMu.Unlock()
 
 	if pc != nil {
 		pc.Close()
 	}
-}
-
-func (h *Hub) renegotiate(peer *Peer) error {
-	peer.RLock()
-	pc := peer.PC
-	peer.RUnlock()
-
-	if pc == nil {
-		return fmt.Errorf("no peer connection")
-	}
-
-	// Only renegotiate when the PC is in a stable state.
-	// If we're still waiting for an answer to a previous offer, mark for retry.
-	if pc.SignalingState() != webrtc.SignalingStateStable {
-		log.Printf("peer %s: deferring renegotiation, signaling state is %s", peer.ID, pc.SignalingState().String())
-		peer.Lock()
-		peer.NeedsRenegotiation = true
-		peer.Unlock()
-		return nil
-	}
-
-	peer.Lock()
-	peer.NeedsRenegotiation = false
-	peer.Unlock()
-
-	offer, err := pc.CreateOffer(nil)
-	if err != nil {
-		return fmt.Errorf("create offer: %w", err)
-	}
-
-	if err := pc.SetLocalDescription(offer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
-	}
-
-	peer.SendJSON("offer", OfferPayload{SDP: offer.SDP})
-	return nil
 }
 
 // removeTrackFromRoomPeers removes a specific track from all PeerConnections in the room
@@ -414,6 +683,7 @@ func (h *Hub) removeTrackFromRoomPeers(track *webrtc.TrackLocalStaticRTP, room *
 	}
 	room.mu.RUnlock()
 
+	needsRenego := make([]*Peer, 0, len(peers))
 	for _, p := range peers {
 		p.RLock()
 		pc := p.PC
@@ -422,18 +692,28 @@ func (h *Hub) removeTrackFromRoomPeers(track *webrtc.TrackLocalStaticRTP, room *
 			continue
 		}
 
+		removed := false
 		for _, sender := range pc.GetSenders() {
 			if sender.Track() == track {
 				if err := pc.RemoveTrack(sender); err != nil {
 					log.Printf("failed to remove track from %s: %v", p.ID, err)
+					continue
 				}
-				break
+				removed = true
 			}
 		}
 
-		if err := h.renegotiate(p); err != nil {
-			log.Printf("failed to renegotiate with %s: %v", p.ID, err)
+		if removed {
+			needsRenego = append(needsRenego, p)
 		}
+	}
+
+	for _, p := range needsRenego {
+		go func(target *Peer) {
+			if err := h.NegotiateOffer(target, false); err != nil {
+				log.Printf("failed to renegotiate with %s: %v", target.ID, err)
+			}
+		}(p)
 	}
 }
 
@@ -446,6 +726,51 @@ func (h *Hub) getWebRTCAPI() *webrtc.API {
 		h.webrtcAPI = api
 	}
 	return h.webrtcAPI
+}
+
+func (h *Hub) drainSenderRTCP(sender *webrtc.RTPSender) {
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(rtcpBuf); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+func hasSenderForTrack(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticRTP) bool {
+	for _, sender := range pc.GetSenders() {
+		if sender.Track() == track {
+			return true
+		}
+	}
+	return false
+}
+
+func summarizeTransceivers(pc *webrtc.PeerConnection) string {
+	total := 0
+	sendonly := 0
+	recvonly := 0
+	sendrecv := 0
+	inactive := 0
+
+	for _, tr := range pc.GetTransceivers() {
+		total++
+		switch tr.Direction() {
+		case webrtc.RTPTransceiverDirectionSendonly:
+			sendonly++
+		case webrtc.RTPTransceiverDirectionRecvonly:
+			recvonly++
+		case webrtc.RTPTransceiverDirectionSendrecv:
+			sendrecv++
+		case webrtc.RTPTransceiverDirectionInactive:
+			inactive++
+		}
+	}
+
+	return strings.TrimSpace(fmt.Sprintf("total=%d sendonly=%d recvonly=%d sendrecv=%d inactive=%d",
+		total, sendonly, recvonly, sendrecv, inactive))
 }
 
 func safeString(s *string) string {

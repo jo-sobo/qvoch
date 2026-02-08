@@ -86,7 +86,7 @@ export function SettingsPanel() {
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setSettingsOpen(false)}>
       <div
-        className="bg-bg-secondary border border-border rounded-lg w-full max-w-md max-h-[80vh] overflow-y-auto"
+        className="bg-bg-secondary border border-border rounded-lg w-full max-w-md max-h-[80dvh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-border">

@@ -66,12 +66,16 @@ export interface JoinPayload {
 
 export interface AnswerPayload {
   sdp: string;
+  seq: number;
+  epoch: number;
 }
 
 export interface CandidatePayload {
   candidate: string;
   sdpMid: string;
-  sdpMLineIndex: number;
+  sdpMLineIndex: number | null;
+  seq: number;
+  epoch: number;
 }
 
 export interface ChatPayload {
@@ -99,6 +103,7 @@ export interface WelcomePayload {
   sessionToken: string;
   inviteToken: string;
   roomState: RoomState;
+  reconnectNotice?: string;
 }
 
 export interface ErrorPayload {
@@ -114,6 +119,8 @@ export interface RoomUpdatePayload {
 export interface OfferPayload {
   sdp: string;
   reset?: boolean;
+  seq: number;
+  epoch: number;
 }
 
 export interface InviteReqPayload {
@@ -127,4 +134,3 @@ export interface InviteExpiredPayload {
   inviteId: string;
   reason: 'timeout' | 'declined';
 }
-

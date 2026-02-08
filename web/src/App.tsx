@@ -3,7 +3,8 @@ import { useStore } from './stores/useStore';
 import { LandingPage } from './components/LandingPage';
 import { RoomView } from './components/RoomView';
 import { ToastContainer } from './components/Toast';
-import { persistSessionForRejoin } from './services/socket';
+import { connect, persistSessionForRejoin } from './services/socket';
+import { ensureAudioContext } from './services/webrtc';
 
 type View = 'landing' | 'room';
 
@@ -27,6 +28,23 @@ function App() {
 
     window.addEventListener('beforeunload', handleBeforeUnload);
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [roomId]);
+
+  useEffect(() => {
+    if (!roomId) return;
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        ensureAudioContext();
+        const store = useStore.getState();
+        if (!store.connected) {
+          connect();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, [roomId]);
 
   useEffect(() => {

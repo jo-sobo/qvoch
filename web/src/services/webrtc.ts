@@ -12,7 +12,18 @@ let pc: RTCPeerConnection | null = null;
 let localStream: MediaStream | null = null;
 let audioContext: AudioContext | null = null;
 let localAnalyser: AnalyserNode | null = null;
-let pendingCandidates: RTCIceCandidateInit[] = [];
+
+type PendingCandidate = {
+  ice: RTCIceCandidateInit;
+  seq: number;
+  epoch: number;
+};
+
+let pendingCandidates: PendingCandidate[] = [];
+let offerQueue: Promise<void> = Promise.resolve();
+let lastProcessedSeq = 0;
+let activeOfferSeq = 0;
+let currentEpoch = 0;
 
 // No-ops: mic is now requested before create/join, so handleOffer no longer
 // needs to wait for local audio. Kept as exports for API compatibility.
@@ -41,7 +52,6 @@ export function setVolumeCallback(cb: VolumeCallback | null): void {
 
 export function setLocalVolumeCallback(cb: LocalVolumeCallback | null): void {
   localVolumeCallback = cb;
-  // Start monitoring loop if not already running (needed when alone in room)
   if (cb && !volumeAnimFrame) {
     startVolumeMonitoring();
   }
@@ -72,7 +82,6 @@ export async function initLocalAudio(deviceId?: string | null): Promise<MediaStr
 
   localStream = newStream;
 
-  // Apply current mute state to newly acquired tracks
   const isMuted = useStore.getState().muted;
   for (const track of newStream.getAudioTracks()) {
     track.enabled = !isMuted;
@@ -86,6 +95,7 @@ export async function initLocalAudio(deviceId?: string | null): Promise<MediaStr
       localAnalyser.fftSize = 256;
       source.connect(localAnalyser);
     } catch {
+      // no-op
     }
   }
 
@@ -113,14 +123,47 @@ export function ensureAudioContext(): void {
     audioContext = new AudioContext();
   }
   if (audioContext.state === 'suspended') {
-    audioContext.resume();
+    audioContext.resume().catch(() => {});
+  }
+
+  for (const [, entry] of remoteStreams) {
+    if (entry.audio.paused && entry.audio.srcObject) {
+      entry.audio.play().catch(() => {});
+    }
   }
 }
 
-export async function handleOffer(sdp: string, reset?: boolean): Promise<void> {
-  // When reset=true, the server created a brand-new PeerConnection (room
-  // transition) — the client MUST tear down its old PC and build a fresh one.
-  // Otherwise, reuse the existing PC for renegotiation (new peer joined, etc.).
+export function handleOffer(sdp: string, reset: boolean | undefined, seq: number, epoch: number): void {
+  offerQueue = offerQueue
+    .then(async () => {
+      if (reset) {
+        if (epoch < currentEpoch) {
+          console.warn(`Dropping stale reset offer epoch=${epoch}, current=${currentEpoch}`);
+          return;
+        }
+        currentEpoch = epoch;
+        lastProcessedSeq = 0;
+      } else {
+        if (epoch !== currentEpoch) {
+          console.warn(`Dropping offer: epoch mismatch ${epoch} vs current ${currentEpoch}`);
+          return;
+        }
+      }
+
+      if (seq <= lastProcessedSeq) {
+        console.warn(`Dropping stale offer seq=${seq}, last=${lastProcessedSeq}`);
+        return;
+      }
+
+      await processOffer(sdp, !!reset, seq);
+      lastProcessedSeq = seq;
+    })
+    .catch((err) => {
+      console.error('Offer processing error:', err);
+    });
+}
+
+async function processOffer(sdp: string, reset: boolean, seq: number): Promise<void> {
   const canReuse = !reset
     && pc !== null
     && pc.connectionState !== 'failed'
@@ -130,34 +173,46 @@ export async function handleOffer(sdp: string, reset?: boolean): Promise<void> {
     createPeerConnection();
   }
 
-  // Capture in local variable for TypeScript narrowing across awaits
   const currentPc = pc;
   if (!currentPc) return;
 
+  activeOfferSeq = seq;
   const offer = new RTCSessionDescription({ type: 'offer', sdp });
 
   try {
     await currentPc.setRemoteDescription(offer);
 
-    // Flush any ICE candidates that arrived before the PC was ready
-    for (const ice of pendingCandidates) {
-      currentPc.addIceCandidate(new RTCIceCandidate(ice)).catch((err) =>
+    const pendingForCurrent = pendingCandidates.filter((item) => item.epoch === currentEpoch);
+    pendingCandidates = pendingCandidates.filter((item) => item.epoch !== currentEpoch);
+
+    for (const item of pendingForCurrent) {
+      currentPc.addIceCandidate(new RTCIceCandidate(item.ice)).catch((err) =>
         console.error('Failed to add buffered ICE candidate:', err)
       );
     }
-    pendingCandidates = [];
 
     const answer = await currentPc.createAnswer();
     await currentPc.setLocalDescription(answer);
+
     if (currentPc.localDescription) {
-      send('answer', { sdp: currentPc.localDescription.sdp });
+      send('answer', { sdp: currentPc.localDescription.sdp, seq, epoch: currentEpoch });
     }
   } catch (err) {
     console.error('Failed to handle offer:', err);
   }
 }
 
-export function handleCandidate(candidate: string, sdpMid: string, sdpMLineIndex: number | null): void {
+export function handleCandidate(
+  candidate: string,
+  sdpMid: string,
+  sdpMLineIndex: number | null,
+  seq: number,
+  epoch: number,
+): void {
+  if (epoch !== currentEpoch) {
+    return;
+  }
+
   const ice: RTCIceCandidateInit = {
     candidate,
     sdpMid: sdpMid || undefined,
@@ -165,7 +220,7 @@ export function handleCandidate(candidate: string, sdpMid: string, sdpMLineIndex
   };
 
   if (!pc || !pc.remoteDescription) {
-    pendingCandidates.push(ice);
+    pendingCandidates.push({ ice, seq, epoch });
     return;
   }
 
@@ -182,6 +237,8 @@ function createPeerConnection(): void {
   }
 
   pendingCandidates = [];
+  lastProcessedSeq = 0;
+  activeOfferSeq = 0;
 
   if (pc) {
     pc.close();
@@ -191,6 +248,7 @@ function createPeerConnection(): void {
   for (const [, entry] of remoteStreams) {
     entry.audio.pause();
     entry.audio.srcObject = null;
+    entry.sourceNode?.disconnect();
   }
   remoteStreams.clear();
 
@@ -208,6 +266,8 @@ function createPeerConnection(): void {
         candidate: event.candidate.candidate,
         sdpMid: event.candidate.sdpMid || '0',
         sdpMLineIndex: event.candidate.sdpMLineIndex ?? 0,
+        seq: activeOfferSeq,
+        epoch: currentEpoch,
       });
     }
   };
@@ -216,7 +276,32 @@ function createPeerConnection(): void {
     const stream = event.streams[0] || new MediaStream([event.track]);
     const streamId = stream.id;
 
-    if (remoteStreams.has(streamId)) return;
+    if (remoteStreams.has(streamId)) {
+      const existing = remoteStreams.get(streamId)!;
+      existing.audio.srcObject = stream;
+      const userId = extractUserIdFromStreamId(streamId);
+      const { userVolumes, outputMuted } = useStore.getState();
+      const vol = userId && userVolumes[userId] != null ? userVolumes[userId] / 100 : 1.0;
+      existing.audio.volume = Math.max(0, Math.min(1, vol));
+      existing.audio.muted = outputMuted;
+      existing.audio.play().catch(() => {});
+
+      if (existing.sourceNode && audioContext) {
+        try {
+          existing.sourceNode.disconnect();
+          const newSource = audioContext.createMediaStreamSource(stream);
+          if (existing.analyser) {
+            newSource.connect(existing.analyser);
+          }
+          existing.sourceNode = newSource;
+        } catch {
+          // no-op
+        }
+      }
+
+      attachTrackLifecycle(event.track, streamId);
+      return;
+    }
 
     ensureAudioContext();
 
@@ -224,39 +309,28 @@ function createPeerConnection(): void {
     let gainNode: GainNode | null = null;
     let sourceNode: MediaStreamAudioSourceNode | null = null;
     const audio = new Audio();
+    audio.srcObject = stream;
+    audio.autoplay = true;
+    const userId = extractUserIdFromStreamId(streamId);
+    const { userVolumes, outputMuted } = useStore.getState();
+    const vol = userId && userVolumes[userId] != null ? userVolumes[userId] / 100 : 1.0;
+    audio.volume = Math.max(0, Math.min(1, vol));
+    audio.muted = outputMuted;
+    audio.play().catch(() => {});
 
     if (audioContext) {
       try {
         sourceNode = audioContext.createMediaStreamSource(stream);
-        gainNode = audioContext.createGain();
         analyser = audioContext.createAnalyser();
         analyser.fftSize = 256;
-
-        const userId = extractUserIdFromStreamId(streamId);
-        const { userVolumes, outputMuted } = useStore.getState();
-        if (outputMuted) {
-          gainNode.gain.value = 0;
-        } else {
-          gainNode.gain.value = userId && userVolumes[userId] != null
-            ? userVolumes[userId] / 100
-            : 1.0;
-        }
-
-        sourceNode.connect(gainNode);
-        gainNode.connect(analyser);
-        gainNode.connect(audioContext.destination);
+        sourceNode.connect(analyser);
       } catch {
-        audio.srcObject = stream;
-        audio.autoplay = true;
-        audio.play().catch(() => {});
+        // no-op
       }
-    } else {
-      audio.srcObject = stream;
-      audio.autoplay = true;
-      audio.play().catch(() => {});
     }
 
     remoteStreams.set(streamId, { audio, analyser, gainNode, sourceNode });
+    attachTrackLifecycle(event.track, streamId);
 
     if (!volumeAnimFrame) {
       startVolumeMonitoring();
@@ -265,6 +339,18 @@ function createPeerConnection(): void {
 
   pc.onconnectionstatechange = () => {
     console.log('RTC connection state:', pc?.connectionState);
+  };
+}
+
+function attachTrackLifecycle(track: MediaStreamTrack, streamId: string): void {
+  track.onended = () => {
+    const entry = remoteStreams.get(streamId);
+    if (entry) {
+      entry.audio.pause();
+      entry.audio.srcObject = null;
+      entry.sourceNode?.disconnect();
+      remoteStreams.delete(streamId);
+    }
   };
 }
 
@@ -311,18 +397,6 @@ export function setMuted(muted: boolean): void {
 
 export function setOutputMuted(muted: boolean): void {
   for (const [, entry] of remoteStreams) {
-    if (entry.gainNode) {
-      if (muted) {
-        entry.gainNode.gain.value = 0;
-      } else {
-        const streamId = [...remoteStreams.entries()].find(([, v]) => v === entry)?.[0];
-        const userId = streamId ? extractUserIdFromStreamId(streamId) : null;
-        const userVolumes = useStore.getState().userVolumes;
-        entry.gainNode.gain.value = userId && userVolumes[userId] != null
-          ? userVolumes[userId] / 100
-          : 1.0;
-      }
-    }
     entry.audio.muted = muted;
   }
 }
@@ -338,11 +412,10 @@ export function setOutputDevice(deviceId: string): void {
 }
 
 export function setUserVolume(userId: string, volume: number): void {
-  const gain = volume / 100;
   const streamId = `stream-${userId}`;
   const entry = remoteStreams.get(streamId);
-  if (entry?.gainNode) {
-    entry.gainNode.gain.value = gain;
+  if (entry) {
+    entry.audio.volume = Math.max(0, Math.min(1, volume / 100));
   }
 }
 
@@ -362,6 +435,7 @@ export function closeWebRTC(): void {
   for (const [, entry] of remoteStreams) {
     entry.audio.pause();
     entry.audio.srcObject = null;
+    entry.sourceNode?.disconnect();
   }
   remoteStreams.clear();
 
@@ -384,4 +458,9 @@ export function closeWebRTC(): void {
     audioContext = null;
   }
 
+  pendingCandidates = [];
+  offerQueue = Promise.resolve();
+  lastProcessedSeq = 0;
+  activeOfferSeq = 0;
+  currentEpoch = 0;
 }

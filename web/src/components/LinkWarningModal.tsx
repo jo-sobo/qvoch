@@ -15,7 +15,7 @@ export function LinkWarningModal({ url, onConfirm, onCancel }: LinkWarningModalP
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[200]" onClick={onCancel}>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-100" onClick={onCancel}>
       <div className="bg-bg-secondary border border-border rounded-lg p-5 max-w-sm w-full mx-4 shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2 mb-3">
           <ShieldAlert className="w-5 h-5 text-amber-400" />
