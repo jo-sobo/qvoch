@@ -2,6 +2,36 @@
 
 **Quick Voice Channel** — a self-hosted, ephemeral voice chat application. No accounts, no database, no tracking. Create a room, share the link, chat and talk.
 
+## Product Goal
+
+QVoCh stands for **Quick Voice CHannel**.
+
+Its goal is to provide fast, private voice communication with minimal setup and minimal operational overhead. QVoCh is built for instant use: self-hosted, containerized, and powered by WebRTC, without account systems or persistent channel clutter.
+
+## Core Features
+
+### Zero-Friction Access
+
+- **No registration required:** Start talking without creating accounts.
+- **Instant invites:** Create a channel and share a link.
+
+### Smart Ephemeral Channels
+
+- **Automatic cleanup:** Main channels close after 30 minutes of being empty.
+- **Dynamic sub-channels:** Private breakout rooms are created on demand and removed when empty.
+- **Anti-loitering behavior:** If a user is alone in a sub-channel for 5 minutes, they are moved back to Main and the sub-channel is closed.
+
+### Communication Experience
+
+- **High-quality voice:** WebRTC audio with mute/deafen controls.
+- **Per-channel text chat:** Each channel includes a dedicated chat stream.
+- **Expressive messaging:** GIF support, mentions (`@user`), and emoticons.
+
+### Deployment Model
+
+- **Containerized:** Simple deployment on your own infrastructure.
+- **Self-hosted:** You control data and conversation streams.
+
 ## Features
 
 - **Voice chat** via WebRTC SFU (Selective Forwarding Unit)
