@@ -58,3 +58,11 @@ jobs:
             BUILD_BRANCH=${{ steps.meta.outputs.build_branch }}
             BUILD_COMMIT=${{ steps.meta.outputs.short_sha }}
             BUILD_TIME=${{ steps.meta.outputs.build_time }}
+
+      - name: Update Docker Hub Description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: ${{ env.IMAGE_NAME }}
+          short-description: ${{ github.event.repository.description }}

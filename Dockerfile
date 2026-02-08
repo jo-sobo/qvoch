@@ -25,6 +25,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 FROM alpine:3.19
 ARG BUILD_ID=non-official-unknown-nogit-notime
 ENV QVOCH_BUILD_ID=${BUILD_ID}
+LABEL org.opencontainers.image.source="https://github.com/jo-sobo/qvoch"
 RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=backend-builder /app/server .
