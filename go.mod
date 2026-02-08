@@ -1,4 +1,4 @@
-module github.com/jonas/qvoch
+module github.com/jo-sobo/qvoch
 
 go 1.24.0
 

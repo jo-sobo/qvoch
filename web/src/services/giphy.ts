@@ -1,12 +1,6 @@
-declare global {
-  interface Window {
-    __QVOCH_CONFIG__?: {
-      giphyApiKey?: string;
-    };
-  }
-}
+import { getRuntimeGiphyApiKey } from './runtimeConfig';
 
-const runtimeApiKey = window.__QVOCH_CONFIG__?.giphyApiKey || '';
+const runtimeApiKey = getRuntimeGiphyApiKey();
 const API_KEY = runtimeApiKey || import.meta.env.VITE_GIPHY_API_KEY || '';
 const BASE_URL = 'https://api.giphy.com/v1/gifs';
 

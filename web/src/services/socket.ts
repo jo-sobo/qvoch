@@ -28,7 +28,6 @@ function initBroadcastChannel(): void {
     if (event.data === 'active') {
       const store = useStore.getState();
       if (store.roomId) {
-        store.addToast('Connected in another tab. This tab will be disconnected.');
         disconnect();
         closeWebRTC();
         store.reset();

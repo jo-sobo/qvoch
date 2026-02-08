@@ -1,6 +1,6 @@
 # QVoCh
 
-**Quick Voice Channel** — a self-hosted, ephemeral voice chat application. No accounts, no database, no tracking. Create a room, share the link, talk.
+**Quick Voice Channel** — a self-hosted, ephemeral voice chat application. No accounts, no database, no tracking. Create a room, share the link, chat and talk.
 
 ## Features
 
@@ -12,16 +12,23 @@
 - **Single container** — one Docker image serves frontend, signaling, and media relay
 - **Site passphrase** — optional access control without user accounts
 - **GIF & emoji support** via Giphy integration
+- **Auto-rejoin on reload/network drops** via session token restore
 
 ## Quick Start
 
 ### Docker (recommended)
 
 ```bash
-docker build -t qvoch .
+# Build image (native platform)
+IMAGE_TAG="qvoch"
+./scripts/docker-build.sh "$IMAGE_TAG"
+
+# Optional: force amd64 build (for x86_64 servers/registries)
+DOCKER_DEFAULT_PLATFORM=linux/amd64 ./scripts/docker-build.sh "$IMAGE_TAG"
+
 docker run -p 17223:17223 -p 40000-40100:40000-40100/udp \
   -e PUBLIC_IP=your-server-ip \
-  qvoch
+  "$IMAGE_TAG"
 ```
 
 Open `http://localhost:17223` in your browser.
@@ -39,7 +46,7 @@ cd web && npm install && npm run dev
 ## Configuration
 
 All runtime configuration is done via environment variables.
-Use `.env` with `docker run --env-file .env ...` or set variables individually.
+Copy `.env.example` to `.env`, then use `docker run --env-file .env ...` or set variables individually.
 
 ### Runtime / container env vars
 
@@ -66,6 +73,25 @@ These are only for running the frontend directly with Vite (`cd web && npm run d
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VITE_GIPHY_API_KEY` | *(empty)* | Dev fallback used only when runtime config key is not present. Put it in `web/.env.local`. |
+
+### Build metadata (serverBuildID)
+
+Default local/community builds should be labeled as non-official.
+Build ID format:
+
+`non-official-<branch>-<short-commit>-<UTC build time>[-dirty]`
+
+- Example: `non-official-main-a1b2c3d4e5f6-20260208-201530`
+- `-dirty` is appended when Go VCS metadata reports local uncommitted changes at build time.
+
+`./scripts/docker-build.sh` always produces non-official build IDs.
+
+The same build ID is used in:
+- backend startup log (`build=...`)
+- settings footer in the UI
+- landing page footer in the UI
+
+Official labels are reserved for maintainer release builds.
 
 ### Giphy
 
