@@ -1,7 +1,11 @@
 import { useStore } from '../stores/useStore';
 import { send } from '../services/socket';
-import { setUserVolume as setWebRTCUserVolume } from '../services/webrtc';
-import { Mic, MicOff, Volume2 } from 'lucide-react';
+import {
+  setUserVolume as setWebRTCUserVolume,
+  subscribeVolumeCallback,
+  subscribeVoiceTransmissionCallback,
+} from '../services/webrtc';
+import { MicOff, Volume2, VolumeX } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 
 interface ContextMenuState {
@@ -47,14 +51,18 @@ export function UserList() {
   const currentChannelId = useStore((s) => s.currentChannelId);
   const roomId = useStore((s) => s.roomId);
   const myUserId = useStore((s) => s.userId);
+  const outputMuted = useStore((s) => s.outputMuted);
   const userVolumes = useStore((s) => s.userVolumes);
   const storeSetUserVolume = useStore((s) => s.setUserVolume);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [inviteNameInput, setInviteNameInput] = useState(false);
   const [channelName, setChannelName] = useState('');
+  const [talkingUsers, setTalkingUsers] = useState<Record<string, boolean>>({});
+  const [localTalking, setLocalTalking] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const touchStartPos = useRef<{ x: number; y: number } | null>(null);
+  const recentSpeechAt = useRef<Record<string, number>>({});
 
   useEffect(() => {
     const handler = () => {
@@ -63,6 +71,53 @@ export function UserList() {
     };
     document.addEventListener('click', handler);
     return () => document.removeEventListener('click', handler);
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribeVolumeCallback((volumes) => {
+      const now = performance.now();
+      const speakingThreshold = 18;
+      const holdMs = 240;
+
+      for (const [streamId, level] of volumes) {
+        if (!streamId.startsWith('stream-')) continue;
+        const userId = streamId.slice(7);
+        if (level >= speakingThreshold) {
+          recentSpeechAt.current[userId] = now;
+        }
+      }
+
+      const nextTalking: Record<string, boolean> = {};
+      for (const [userId, ts] of Object.entries(recentSpeechAt.current)) {
+        if (now - ts <= holdMs) {
+          nextTalking[userId] = true;
+        } else {
+          delete recentSpeechAt.current[userId];
+        }
+      }
+
+      setTalkingUsers((prev) => {
+        const prevIds = Object.keys(prev);
+        const nextIds = Object.keys(nextTalking);
+        if (prevIds.length === nextIds.length && nextIds.every((id) => prev[id])) {
+          return prev;
+        }
+        return nextTalking;
+      });
+    });
+
+    return () => {
+      unsubscribe();
+      recentSpeechAt.current = {};
+      setTalkingUsers({});
+    };
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = subscribeVoiceTransmissionCallback((active) => {
+      setLocalTalking((prev) => (prev === active ? prev : active));
+    });
+    return () => unsubscribe();
   }, []);
 
   const mainChannelUsers = users.filter((u) => !u.inSubChannel);
@@ -162,33 +217,48 @@ export function UserList() {
           >
             Main Channel
           </div>
-          {mainChannelUsers.map((user) => (
-            <div
-              key={user.id}
-              onContextMenu={(e) => handleContextMenu(e, user.id)}
-              onTouchStart={(e) => handleTouchStart(e, user.id)}
-              onTouchMove={handleTouchMove}
-              onTouchEnd={handleTouchEnd}
-              onTouchCancel={handleTouchEnd}
-              className={`flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-bg-tertiary/30 cursor-default ${
-                user.id === myUserId ? 'bg-bg-tertiary/20' : ''
-              }`}
-            >
-              <div className="relative">
-                {user.muted ? (
-                  <MicOff className="w-4 h-4 text-text-muted" />
-                ) : (
-                  <Mic className="w-4 h-4 text-success" />
-                )}
+          {mainChannelUsers.map((user) => {
+            const isMe = user.id === myUserId;
+            const userVolume = userVolumes[user.id] ?? 100;
+            const speakerMuted = userVolume <= 0 || (isMe && outputMuted);
+            const talking = isMe ? localTalking : (!user.muted && !!talkingUsers[user.id]);
+
+            return (
+              <div
+                key={user.id}
+                onContextMenu={(e) => handleContextMenu(e, user.id)}
+                onTouchStart={(e) => handleTouchStart(e, user.id)}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onTouchCancel={handleTouchEnd}
+                className={`flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-bg-tertiary/30 cursor-default ${
+                  isMe ? 'bg-bg-tertiary/20' : ''
+                }`}
+              >
+                <div className="flex items-center gap-1 min-w-4">
+                  <span
+                    className={`w-2.5 h-2.5 rounded-full transition-all ${
+                      talking ? 'bg-speaking animate-pulse' : 'bg-text-muted/60'
+                    }`}
+                    style={{
+                      boxShadow: talking
+                        ? '0 0 0 3px rgba(34,197,94,0.2)'
+                        : '0 0 0 2px rgba(90,90,110,0.22)',
+                    }}
+                    title={talking ? 'Talking' : 'Not talking'}
+                  />
+                  {user.muted && <MicOff className="w-4 h-4 text-text-muted" />}
+                  {speakerMuted && <VolumeX className="w-4 h-4 text-text-muted" />}
+                </div>
+                <span className="flex-1 min-w-0 text-sm text-text-primary truncate">
+                  {user.name}
+                  {isMe && (
+                    <span className="text-text-muted ml-1">(you)</span>
+                  )}
+                </span>
               </div>
-              <span className="text-sm text-text-primary truncate">
-                {user.name}
-                {user.id === myUserId && (
-                  <span className="text-text-muted ml-1">(you)</span>
-                )}
-              </span>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         {subChannels.map((sub) => {
@@ -217,31 +287,48 @@ export function UserList() {
                   </div>
                 )}
               </div>
-              {sub.users.map((user) => (
-                <div
-                  key={user.id}
-                  onContextMenu={(e) => handleContextMenu(e, user.id)}
-                  onTouchStart={(e) => handleTouchStart(e, user.id)}
-                  onTouchMove={handleTouchMove}
-                  onTouchEnd={handleTouchEnd}
-                  onTouchCancel={handleTouchEnd}
-                  className={`flex items-center gap-2 px-4 py-1.5 rounded-md ${
-                    user.id === myUserId ? 'bg-bg-tertiary/20' : ''
-                  }`}
-                >
-                  {user.muted ? (
-                    <MicOff className="w-3.5 h-3.5 text-text-muted" />
-                  ) : (
-                    <Mic className="w-3.5 h-3.5 text-success" />
-                  )}
-                  <span className="text-sm text-text-secondary truncate">
-                    {user.name}
-                    {user.id === myUserId && (
-                      <span className="text-text-muted ml-1">(you)</span>
-                    )}
-                  </span>
-                </div>
-              ))}
+              {sub.users.map((user) => {
+                const isMe = user.id === myUserId;
+                const userVolume = userVolumes[user.id] ?? 100;
+                const speakerMuted = userVolume <= 0 || (isMe && outputMuted);
+                const talking = isMe ? localTalking : (!user.muted && !!talkingUsers[user.id]);
+
+                return (
+                  <div
+                    key={user.id}
+                    onContextMenu={(e) => handleContextMenu(e, user.id)}
+                    onTouchStart={(e) => handleTouchStart(e, user.id)}
+                    onTouchMove={handleTouchMove}
+                    onTouchEnd={handleTouchEnd}
+                    onTouchCancel={handleTouchEnd}
+                    className={`flex items-center gap-2 px-4 py-1.5 rounded-md ${
+                      isMe ? 'bg-bg-tertiary/20' : ''
+                    }`}
+                  >
+                    <div className="flex items-center gap-1 min-w-4">
+                      <span
+                        className={`w-2 h-2 rounded-full transition-all ${
+                          talking ? 'bg-speaking animate-pulse' : 'bg-text-muted/60'
+                        }`}
+                        style={{
+                          boxShadow: talking
+                            ? '0 0 0 3px rgba(34,197,94,0.2)'
+                            : '0 0 0 2px rgba(90,90,110,0.22)',
+                        }}
+                        title={talking ? 'Talking' : 'Not talking'}
+                      />
+                      {user.muted && <MicOff className="w-3.5 h-3.5 text-text-muted" />}
+                      {speakerMuted && <VolumeX className="w-3.5 h-3.5 text-text-muted" />}
+                    </div>
+                    <span className="flex-1 min-w-0 text-sm text-text-secondary truncate">
+                      {user.name}
+                      {isMe && (
+                        <span className="text-text-muted ml-1">(you)</span>
+                      )}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           );
         })}
@@ -263,7 +350,7 @@ export function UserList() {
             </div>
             <input
               type="range"
-              min="10"
+              min="0"
               max="150"
               value={userVolumes[contextMenu.userId] ?? 100}
               onChange={(e) => handleVolumeChange(contextMenu.userId, Number(e.target.value))}

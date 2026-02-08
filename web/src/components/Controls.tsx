@@ -1,6 +1,6 @@
 import { useStore } from '../stores/useStore';
-import { send, disconnect } from '../services/socket';
-import { setMuted as setWebRTCMuted, setOutputMuted as setWebRTCOutputMuted, closeWebRTC } from '../services/webrtc';
+import { send, leaveRoomAndReset } from '../services/socket';
+import { setMuted as setWebRTCMuted, setOutputMuted as setWebRTCOutputMuted } from '../services/webrtc';
 import { Mic, MicOff, LogOut, ArrowLeft, Settings, Headphones, HeadphoneOff } from 'lucide-react';
 
 export function Controls() {
@@ -10,7 +10,6 @@ export function Controls() {
   const storeSetOutputMuted = useStore((s) => s.setOutputMuted);
   const currentChannelId = useStore((s) => s.currentChannelId);
   const roomId = useStore((s) => s.roomId);
-  const reset = useStore((s) => s.reset);
   const setSettingsOpen = useStore((s) => s.setSettingsOpen);
 
   const isInSubChannel = currentChannelId !== roomId;
@@ -29,15 +28,7 @@ export function Controls() {
   };
 
   const handleLeave = () => {
-    send('leave', {});
-    closeWebRTC();
-    disconnect();
-    localStorage.removeItem('sessionToken');
-    localStorage.removeItem('qvoch-session-token');
-    localStorage.removeItem('qvoch-session-time');
-    localStorage.removeItem('qvoch-session-username');
-    reset();
-    window.location.hash = '#/';
+    leaveRoomAndReset();
   };
 
   const handleReturnToMain = () => {

@@ -45,6 +45,7 @@ export function SettingsPanel() {
             .map((d) => ({ deviceId: d.deviceId, label: d.label || `Speaker ${d.deviceId.slice(0, 8)}` }))
         );
       } catch {
+        // Device enumeration may fail until permissions are granted.
       }
     }
 
@@ -276,11 +277,10 @@ function CombinedVADBar({
 
         {voiceMode === 'vad' && (
           <div
-            className="absolute top-0 h-full flex items-center"
+            className="absolute top-0 h-full"
             style={{ left: `${vadThreshold}%`, transform: 'translateX(-50%)' }}
           >
-            <div className="w-0.5 h-full bg-accent" />
-            <div className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-accent border-2 border-bg-secondary shadow" />
+            <div className="w-0.5 h-full bg-accent shadow-[0_0_0_1px_rgba(14,165,233,0.2)]" />
           </div>
         )}
       </div>

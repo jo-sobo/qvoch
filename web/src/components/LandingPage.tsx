@@ -8,6 +8,19 @@ import { Headphones, LogIn, Plus, Loader2 } from 'lucide-react';
 type Tab = 'create' | 'join';
 
 const REJOIN_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const REJOIN_KEYS = [
+  'sessionToken',
+  'qvoch-session-token',
+  'qvoch-session-time',
+  'qvoch-session-username',
+  'qvoch-session-invite',
+] as const;
+
+function clearRejoinState(): void {
+  for (const key of REJOIN_KEYS) {
+    localStorage.removeItem(key);
+  }
+}
 
 export function LandingPage() {
   const [tab, setTab] = useState<Tab>('create');
@@ -43,26 +56,23 @@ export function LandingPage() {
   }, []);
 
   useEffect(() => {
+    const sessionToken = localStorage.getItem('qvoch-session-token') || localStorage.getItem('sessionToken');
     const sessionInvite = localStorage.getItem('qvoch-session-invite');
     const sessionTime = localStorage.getItem('qvoch-session-time');
     const sessionUsername = localStorage.getItem('qvoch-session-username');
 
-    if (!sessionInvite || !sessionTime || !sessionUsername) return;
+    if (!sessionTime || !sessionUsername || (!sessionToken && !sessionInvite)) return;
 
     const elapsed = Date.now() - Number(sessionTime);
     if (elapsed > REJOIN_WINDOW_MS) {
-      localStorage.removeItem('qvoch-session-invite');
-      localStorage.removeItem('qvoch-session-time');
-      localStorage.removeItem('qvoch-session-username');
+      clearRejoinState();
       return;
     }
 
     isOtherTabActive().then((active) => {
       if (active) {
         useStore.getState().addToast('Already connected in another tab.');
-        localStorage.removeItem('qvoch-session-invite');
-        localStorage.removeItem('qvoch-session-time');
-        localStorage.removeItem('qvoch-session-username');
+        clearRejoinState();
         return;
       }
       setAutoRejoining(true);
@@ -73,9 +83,10 @@ export function LandingPage() {
   useEffect(() => {
     if (!autoRejoining || !connected) return;
 
+    const sessionToken = localStorage.getItem('qvoch-session-token') || localStorage.getItem('sessionToken');
     const sessionInvite = localStorage.getItem('qvoch-session-invite');
     const sessionUsername = localStorage.getItem('qvoch-session-username');
-    if (!sessionInvite || !sessionUsername) {
+    if (!sessionUsername || (!sessionToken && !sessionInvite)) {
       setAutoRejoining(false);
       return;
     }
@@ -88,23 +99,44 @@ export function LandingPage() {
 
     // Init audio before rejoining (permission already granted, resolves quickly)
     resetLocalAudioPromise();
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
     initLocalAudio(useStore.getState().audioInputDeviceId)
       .catch(() => {})
       .then(() => {
-        send('join', {
-          username: sessionUsername,
-          inviteToken: sessionInvite,
-        });
+        if (sessionToken) {
+          send('join', {
+            username: sessionUsername,
+            sessionToken,
+          });
+          if (sessionInvite) {
+            fallbackTimer = setTimeout(() => {
+              if (!useStore.getState().roomId) {
+                send('join', {
+                  username: sessionUsername,
+                  inviteToken: sessionInvite,
+                });
+              }
+            }, 2500);
+          }
+        } else if (sessionInvite) {
+          send('join', {
+            username: sessionUsername,
+            inviteToken: sessionInvite,
+          });
+        }
       });
 
     const timeout = setTimeout(() => {
       setAutoRejoining(false);
-      localStorage.removeItem('qvoch-session-invite');
-      localStorage.removeItem('qvoch-session-time');
-      localStorage.removeItem('qvoch-session-username');
-    }, 5000);
+      if (!useStore.getState().roomId) {
+        clearRejoinState();
+      }
+    }, 8000);
 
-    return () => clearTimeout(timeout);
+    return () => {
+      clearTimeout(timeout);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+    };
   }, [autoRejoining, connected]);
 
   const handleCreate = async (e: React.FormEvent) => {

@@ -30,17 +30,40 @@ func loadWebRTCConfig() WebRTCConfig {
 	}
 }
 
+func loadWebRTCConfigQuiet() WebRTCConfig {
+	udpMin := getEnvUint16("UDP_MIN", 40000)
+	udpMax := getEnvUint16("UDP_MAX", 40100)
+	publicIP := resolvePublicIPQuiet(os.Getenv("PUBLIC_IP"))
+	return WebRTCConfig{
+		PublicIP: publicIP,
+		UDPMin:   udpMin,
+		UDPMax:   udpMax,
+	}
+}
+
 func resolvePublicIP(raw string) string {
+	return resolvePublicIPInternal(raw, true)
+}
+
+func resolvePublicIPQuiet(raw string) string {
+	return resolvePublicIPInternal(raw, false)
+}
+
+func resolvePublicIPInternal(raw string, verbose bool) string {
 	if raw == "" {
 		return ""
 	}
 	if ip := net.ParseIP(raw); ip != nil {
-		log.Printf("PUBLIC_IP: using %s", raw)
+		if verbose {
+			log.Printf("PUBLIC_IP: using %s", raw)
+		}
 		return raw
 	}
 	ips, err := net.LookupIP(raw)
 	if err != nil || len(ips) == 0 {
-		log.Printf("WARNING: PUBLIC_IP=%q is not a valid IP and could not be resolved — NAT1To1 disabled", raw)
+		if verbose {
+			log.Printf("WARNING: PUBLIC_IP=%q is not a valid IP and could not be resolved — NAT1To1 disabled", raw)
+		}
 		return ""
 	}
 
@@ -49,13 +72,17 @@ func resolvePublicIP(raw string) string {
 	for _, ip := range ips {
 		if ipv4 := ip.To4(); ipv4 != nil {
 			resolved := ipv4.String()
-			log.Printf("PUBLIC_IP: resolved %s → %s (preferred IPv4)", raw, resolved)
+			if verbose {
+				log.Printf("PUBLIC_IP: resolved %s → %s (preferred IPv4)", raw, resolved)
+			}
 			return resolved
 		}
 	}
 
 	resolved := ips[0].String()
-	log.Printf("PUBLIC_IP: resolved %s → %s", raw, resolved)
+	if verbose {
+		log.Printf("PUBLIC_IP: resolved %s → %s", raw, resolved)
+	}
 	return resolved
 }
 
@@ -71,9 +98,44 @@ func getEnvUint16(key string, defaultVal uint16) uint16 {
 	return uint16(n)
 }
 
+func getEnvDuration(key string, defaultVal time.Duration) time.Duration {
+	val := strings.TrimSpace(os.Getenv(key))
+	if val == "" {
+		return defaultVal
+	}
+
+	if d, err := time.ParseDuration(val); err == nil {
+		return d
+	}
+
+	if n, err := strconv.Atoi(val); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+
+	return defaultVal
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	val := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if val == "" {
+		return defaultVal
+	}
+	switch val {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return defaultVal
+	}
+}
+
 func NewWebRTCAPI() (*webrtc.API, WebRTCConfig) {
 	cfg := loadWebRTCConfig()
+	return buildWebRTCAPI(cfg), cfg
+}
 
+func buildWebRTCAPI(cfg WebRTCConfig) *webrtc.API {
 	se := webrtc.SettingEngine{}
 	se.SetEphemeralUDPPortRange(cfg.UDPMin, cfg.UDPMax)
 
@@ -91,7 +153,7 @@ func NewWebRTCAPI() (*webrtc.API, WebRTCConfig) {
 		webrtc.WithMediaEngine(me),
 	)
 
-	return api, cfg
+	return api
 }
 
 func (h *Hub) CreatePeerConnection(peer *Peer, room *Room) error {
@@ -722,10 +784,153 @@ func (h *Hub) getWebRTCAPI() *webrtc.API {
 	defer h.mu.Unlock()
 
 	if h.webrtcAPI == nil {
-		api, _ := NewWebRTCAPI()
+		api, cfg := NewWebRTCAPI()
 		h.webrtcAPI = api
+		h.webrtcCfg = cfg
 	}
 	return h.webrtcAPI
+}
+
+func (h *Hub) startPublicIPMonitor() {
+	source := strings.TrimSpace(os.Getenv("PUBLIC_IP"))
+	if source == "" {
+		return
+	}
+
+	interval := getEnvDuration("PUBLIC_IP_RECHECK_INTERVAL", 0)
+	if interval <= 0 {
+		return
+	}
+	rebuildPeers := getEnvBool("PUBLIC_IP_RECHECK_REBUILD_PEERS", true)
+
+	log.Printf("PUBLIC_IP monitor enabled: source=%s interval=%s rebuildPeers=%t", source, interval, rebuildPeers)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		nextCfg := loadWebRTCConfigQuiet()
+
+		h.mu.RLock()
+		currentCfg := h.webrtcCfg
+		apiInitialized := h.webrtcAPI != nil
+		h.mu.RUnlock()
+
+		if !apiInitialized {
+			continue
+		}
+
+		if nextCfg.PublicIP == "" && currentCfg.PublicIP != "" {
+			log.Printf("PUBLIC_IP monitor: resolution temporarily failed, keeping previous IP %s", currentCfg.PublicIP)
+			continue
+		}
+
+		if nextCfg.PublicIP == currentCfg.PublicIP &&
+			nextCfg.UDPMin == currentCfg.UDPMin &&
+			nextCfg.UDPMax == currentCfg.UDPMax {
+			continue
+		}
+
+		h.applyWebRTCConfig(nextCfg, rebuildPeers)
+	}
+}
+
+func (h *Hub) applyWebRTCConfig(cfg WebRTCConfig, rebuildPeers bool) {
+	api := buildWebRTCAPI(cfg)
+
+	var targets []rebuildEntry
+	h.mu.Lock()
+	prevCfg := h.webrtcCfg
+	h.webrtcAPI = api
+	h.webrtcCfg = cfg
+	mainRooms := make([]*Room, 0, len(h.Rooms))
+	for _, room := range h.Rooms {
+		if room.ParentID == "" {
+			mainRooms = append(mainRooms, room)
+		}
+	}
+	h.mu.Unlock()
+
+	log.Printf("WebRTC config updated: PUBLIC_IP %s -> %s, UDP range %d-%d -> %d-%d",
+		prevCfg.PublicIP, cfg.PublicIP, prevCfg.UDPMin, prevCfg.UDPMax, cfg.UDPMin, cfg.UDPMax)
+
+	if !rebuildPeers {
+		return
+	}
+
+	targets = collectRebuildTargets(mainRooms)
+	if len(targets) == 0 {
+		return
+	}
+
+	log.Printf("Rebuilding %d peer connections to apply updated WebRTC config", len(targets))
+	for _, target := range targets {
+		h.rebuildPeerConnection(target.peer, target.room)
+	}
+}
+
+func collectRebuildTargets(mainRooms []*Room) []rebuildEntry {
+	targets := make([]rebuildEntry, 0)
+
+	for _, mainRoom := range mainRooms {
+		mainRoom.mu.RLock()
+
+		for _, peer := range mainRoom.Peers {
+			peer.RLock()
+			hasPC := peer.PC != nil
+			peer.RUnlock()
+			if hasPC {
+				targets = append(targets, rebuildEntry{peer: peer, room: mainRoom})
+			}
+		}
+
+		for _, subRoom := range mainRoom.SubChannels {
+			subRoom.mu.RLock()
+			for _, peer := range subRoom.Peers {
+				peer.RLock()
+				hasPC := peer.PC != nil
+				peer.RUnlock()
+				if hasPC {
+					targets = append(targets, rebuildEntry{peer: peer, room: subRoom})
+				}
+			}
+			subRoom.mu.RUnlock()
+		}
+
+		mainRoom.mu.RUnlock()
+	}
+
+	return targets
+}
+
+func (h *Hub) rebuildPeerConnection(peer *Peer, room *Room) {
+	room.mu.RLock()
+	_, stillInRoom := room.Peers[peer.ID]
+	room.mu.RUnlock()
+	if !stillInRoom {
+		return
+	}
+
+	h.RemoveTrackFromPeers(peer, room)
+	h.ClosePeerConnection(peer)
+
+	if err := h.CreatePeerConnection(peer, room); err != nil {
+		log.Printf("failed to rebuild peer connection for %s: %v", peer.ID, err)
+		return
+	}
+
+	h.AddTrackToPeers(peer, room)
+	go func(target *Peer, targetRoom *Room) {
+		if err := h.NegotiateOffer(target, true); err != nil {
+			log.Printf("failed to send rebuilt initial offer to %s: %v", target.ID, err)
+			return
+		}
+		if h.AddRoomTracksToPeer(target, targetRoom) {
+			if err := h.NegotiateOffer(target, false); err != nil {
+				log.Printf("failed to send rebuilt room-track offer to %s: %v", target.ID, err)
+			}
+		}
+	}(peer, room)
 }
 
 func (h *Hub) drainSenderRTCP(sender *webrtc.RTPSender) {

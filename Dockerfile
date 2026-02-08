@@ -1,7 +1,5 @@
 # Stage 1: Build Frontend
 FROM node:20-alpine AS frontend-builder
-ARG VITE_GIPHY_API_KEY=""
-ENV VITE_GIPHY_API_KEY=$VITE_GIPHY_API_KEY
 WORKDIR /app/web
 COPY web/package*.json ./
 RUN npm ci --legacy-peer-deps
@@ -23,6 +21,8 @@ RUN apk --no-cache add ca-certificates
 WORKDIR /app
 COPY --from=backend-builder /app/server .
 COPY --from=backend-builder /app/web/dist ./web/dist
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh
 EXPOSE 17223
 EXPOSE 40000-40100/udp
-ENTRYPOINT ["./server"]
+ENTRYPOINT ["./docker-entrypoint.sh"]

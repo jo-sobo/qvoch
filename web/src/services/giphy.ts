@@ -1,4 +1,13 @@
-const API_KEY = import.meta.env.VITE_GIPHY_API_KEY || '';
+declare global {
+  interface Window {
+    __QVOCH_CONFIG__?: {
+      giphyApiKey?: string;
+    };
+  }
+}
+
+const runtimeApiKey = window.__QVOCH_CONFIG__?.giphyApiKey || '';
+const API_KEY = runtimeApiKey || import.meta.env.VITE_GIPHY_API_KEY || '';
 const BASE_URL = 'https://api.giphy.com/v1/gifs';
 
 export interface GifResult {
